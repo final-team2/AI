@@ -1,0 +1,67 @@
+# =============================================================
+#  DevReady AI — .gitignore
+#  핵심 원칙: AI Hub 데이터 · 시크릿 · 모델 가중치는 절대 커밋 금지
+#  (git init "전"에 이 파일부터 두고 시작할 것)
+# =============================================================
+
+# ---- 시크릿 / 토큰 ----
+.api_key
+*.api_key
+*.key
+*.pem
+.env
+**/token
+hf_cache/
+
+# ---- AI Hub 원본 데이터 (재배포 금지) ----
+data/*
+129.*/
+
+# ---- 자가증류 / 학습 데이터 (AI Hub 파생 → 비공개) ----
+*.jsonl
+sft_data*.jsonl
+train*.jsonl
+
+# ---- 모델 가중치 (HF에 호스팅, repo엔 링크만) ----
+lora_adapter*/
+*.bin
+*.safetensors
+*.gguf
+adapter_model.*
+**/checkpoint-*/
+
+# ---- RAG 인덱스 (한국어 은행은 AI Hub 파생) ----
+rag/
+chroma*/
+*.index
+*.faiss
+
+# ---- Python ----
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.ipynb_checkpoints/
+
+# ---- 로그 / 백업 / 실험 산출물 ----
+*.log
+*_pre_*.py
+server_pre_*.py
+*_pre_*.sh
+compare_results*.md
+compare_*.md
+training_summary.json
+
+# ---- OS / 에디터 ----
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# =============================================================
+#  예외 (반드시 맨 마지막): 형식 설명용 가짜 샘플만 공개
+# =============================================================
+!data/
+!data/sft_data.sample.jsonl

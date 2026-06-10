@@ -1,0 +1,50 @@
+DevReady AI — License
+
+========================================================================
+1. Source code (this repository)
+========================================================================
+MIT License
+
+Copyright (c) 2026 Seongchae (jsc1209)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+========================================================================
+2. Model & LoRA adapter   (IMPORTANT — NON-COMMERCIAL)
+========================================================================
+This project fine-tunes LG AI Research's EXAONE-Deep-7.8B.
+
+- The base model "LGAI-EXAONE/EXAONE-Deep-7.8B" is distributed under the
+  EXAONE AI Model License Agreement (non-commercial use only).
+- The LoRA adapter trained in this project is a DERIVATIVE of that model and
+  therefore inherits the SAME non-commercial restriction.
+- Commercial use of the model / adapter is NOT permitted.
+
+The MIT license in section 1 covers ONLY the original source code in this
+repository. Use of the model weights and the adapter is governed by the
+EXAONE license. See the model card for the full terms:
+https://huggingface.co/LGAI-EXAONE/EXAONE-Deep-7.8B
+
+========================================================================
+3. Training data
+========================================================================
+Training used labeling data from AI Hub's "채용 면접 인터뷰" dataset, whose
+redistribution is prohibited. No original or derived training data is included
+in this repository. (data/sft_data.sample.jsonl contains only hand-written,
+fictional examples that illustrate the data format.)

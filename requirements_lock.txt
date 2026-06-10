@@ -1,0 +1,18 @@
+accelerate==1.2.1
+bitsandbytes==0.45.5
+huggingface_hub==0.36.2
+numpy==1.26.3
+safetensors==0.7.0
+tokenizers==0.21.4
+torch==2.4.1+cu124
+torchaudio==2.4.1+cu124
+torchvision==0.19.1+cu124
+transformers==4.48.3
+
+# ===== 음성(STT) 추가 (2026-06-07) — 고정 스택과 독립, torch 미사용 런타임 =====
+faster-whisper==1.2.1
+ctranslate2==4.8.0
+av==17.1.0
+onnxruntime==1.26.0
+python-multipart==0.0.32
+json-repair==0.60.1
