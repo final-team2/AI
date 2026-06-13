@@ -8,7 +8,7 @@ from transformers import AutoTokenizer, AutoModel, AutoModelForCausalLM, BitsAnd
 from peft import PeftModel
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
@@ -22,6 +22,12 @@ LLM_REV   = "e3f42b18f6b1"          # 절대 빼지 말 것 (main은 transformer
 EMB_MODEL = "BAAI/bge-m3"
 ADAPTER   = "/workspace/interview_ai/lora_adapter_v3"
 TRAIN     = "/workspace/interview_ai/train.jsonl"
+
+# ---- 추론 예산 강제 (폭주/524 방지) ----
+BUDGET_FORCE  = True    # 추론이 예산 넘으면 </thought> 강제 후 답변 생성 (False면 기존 동작)
+REASON_BUDGET = 1600    # 추론 단계 토큰 예산 (측정된 정상 최대 1156 위)
+ANSWER_BUDGET = 768     # 강제 종료 후 답변(JSON/텍스트) 생성 예산
+
 
 LANGS = ("ko", "en")
 def norm_lang(lang):
@@ -37,8 +43,8 @@ GEN_PREFILL = {
     "en": "First, let me review the candidate's resume and the job posting and think about which questions fit. ",
 }
 FU_PREFILL = {
-    "ko": "먼저 지원자의 답변에서 더 깊이 확인할 부분을 살펴보겠습니다. ",
-    "en": "First, let me look at what in the candidate's answer is worth probing further. ",
+    "ko": "먼저 지원자의 답변이 구체적인지 두루뭉실한지, 근거가 충분한지 진단한 뒤 후속 질문을 정하겠습니다. ",
+    "en": "First, let me diagnose whether the candidate's answer is specific or vague and well-grounded, then decide the follow-up. ",
 }
 RP_PREFILL = {
     "ko": "먼저 지원자의 면접 결과 전체를 살펴보겠습니다. ",
@@ -169,17 +175,57 @@ def vlen(name, val, lang="ko", required=True):
 def not_ready(lang="ko"):
     return None if "llm" in M else {"ok": False, "error": MSG[lang]["loading"]}
 
-def run_llm(prompt, prefill, use_adapter=True, max_new_tokens=2048):
+import threading
+GEN_LOCK = threading.Lock()   # GPU 생성 직렬화: 동시 요청이 같은 모델에 동시에 generate -> CUDA 충돌/오염 방지
+
+def run_llm(prompt, prefill, use_adapter=True, max_new_tokens=2048,
+            do_sample=False, temperature=0.8, top_p=0.9):
     msgs = [{"role": "user", "content": prompt}]
     text = M["llm_tok"].apply_chat_template(msgs, tokenize=False, add_generation_prompt=True) + prefill
     enc = M["llm_tok"](text, return_tensors="pt", add_special_tokens=False).to(M["llm"].device)
     plen = enc["input_ids"].shape[1]
-    with torch.no_grad():
+
+    gkw = {"do_sample": do_sample}
+    if do_sample:
+        gkw["temperature"] = temperature
+        gkw["top_p"] = top_p
+
+    def _gen(inp, attn, n_tok):
         if use_adapter:
-            o = M["llm"].generate(**enc, max_new_tokens=max_new_tokens, do_sample=False)
-        else:
-            with M["llm"].disable_adapter():
-                o = M["llm"].generate(**enc, max_new_tokens=max_new_tokens, do_sample=False)
+            return M["llm"].generate(input_ids=inp, attention_mask=attn, max_new_tokens=n_tok, **gkw)
+        with M["llm"].disable_adapter():
+            return M["llm"].generate(input_ids=inp, attention_mask=attn, max_new_tokens=n_tok, **gkw)
+
+    forced = False
+    with GEN_LOCK:                          # 한 번에 하나의 generate만 GPU에서 실행 (직렬화)
+        t0 = time.time()
+        with torch.no_grad():
+            if not BUDGET_FORCE:
+                o = _gen(enc["input_ids"], enc["attention_mask"], max_new_tokens)
+            else:
+                rb = min(REASON_BUDGET, max_new_tokens)
+                o1 = _gen(enc["input_ids"], enc["attention_mask"], rb)
+                n1 = int(o1.shape[1] - plen)
+                if n1 < rb:
+                    o = o1                                  # 자연 종료(추론+답변 완료)
+                else:
+                    gen1 = M["llm_tok"].decode(o1[0][plen:], skip_special_tokens=True)
+                    if "</thought>" in gen1:
+                        seq = o1
+                        rem = max(0, max_new_tokens - rb)   # 남은 원래 예산으로 답변 마저
+                    else:
+                        close = M["llm_tok"]("\n</thought>\n", return_tensors="pt",
+                                             add_special_tokens=False).input_ids.to(M["llm"].device)
+                        seq = torch.cat([o1, close], dim=1)
+                        rem = ANSWER_BUDGET                 # 추론 강제 종료 -> 답변 생성
+                        forced = True
+                    o = _gen(seq, torch.ones_like(seq), rem) if rem > 0 else seq
+        dt = time.time() - t0
+    gen_len = int(o.shape[1] - plen)
+    hit = " [CAP]" if gen_len >= max_new_tokens else ""
+    fmark = " [FORCED]" if forced else ""
+    print(f">>> [gen] {gen_len}tok / {dt:.1f}s = {gen_len/max(dt,1e-9):.1f} tok/s "
+          f"(prompt {plen}, cap {max_new_tokens}{hit}{fmark}, adapter={use_adapter}, sample={do_sample})", flush=True)
     return M["llm_tok"].decode(o[0][plen:], skip_special_tokens=False)
 
 # ---------------- 프롬프트 빌더 (언어별) ----------------
@@ -217,35 +263,57 @@ Rules:
 [채용공고]
 {job_posting}"""
 
-def fu_prompt(lang, intro, question, answer):
+def fu_prompt(lang, intro, question, answer, history=None):
+    hist_ko = hist_en = ""
+    if history:
+        try:
+            ls = []
+            for h in history:
+                q = (h.get("question") or "").strip()
+                a = (h.get("answer") or "").strip()
+                if q or a:
+                    ls.append("- Q: " + q + "\n  A: " + a)
+            if ls:
+                body = "\n".join(ls)
+                hist_ko = "[\uc774\uc804 \ub300\ud654 \ud750\ub984] (\uc774\ubbf8 \ub2e4\ub8ec \ub0b4\uc6a9\uc740 \ubc18\ubcf5\ud558\uc9c0 \ub9d0\uace0 \uc774\uc5b4\uc11c \uc2ec\ud654\ud560 \uac83)\n" + body + "\n\n"
+                hist_en = "[Prior conversation] (do not repeat what was covered; build on it)\n" + body + "\n\n"
+        except Exception:
+            hist_ko = hist_en = ""
     if lang == "en":
-        return f"""{intro} Below are an interview question and the candidate's answer. Create ONE follow-up question that probes the candidate's answer more deeply.
+        return f"""{intro} Below are an interview question and the candidate's answer. Analyze the answer, then create ONE natural follow-up question.
+
+[Step 1] Diagnose the answer silently: length (sufficient or too short), specificity (concrete examples/numbers/tech vs vague), basis (reasons given or not), depth (surface vs deep).
+[Step 2] Adapt the follow-up to the diagnosis:
+- If the answer is short, vague, or lacks basis -> directly ask for a concrete example, situation, number, or the reason behind the choice.
+- If the answer is specific and solid -> probe one level deeper: the reason for the choice, comparison with alternatives, trade-offs, or edge cases.
 
 Rules:
-- Point at something vague or worth clarifying in the answer
-- Ground it in what the candidate actually said (do not invent content)
+- Ground it strictly in what the candidate actually said (do not invent content)
+- Keep technical terms (Redux, React Query, JPA, etc.) in their original form; do not transliterate
 - One clear sentence, in English
 - After your thinking, output ONLY this JSON: {{"followup": "follow-up question"}}
 
-[Interview Question]
+{hist_en}[Interview Question]
 {question}
-
 [Candidate Answer]
 {answer}"""
-    return f"""{intro} 아래는 면접 질문과 지원자의 답변입니다. 지원자의 답변을 더 깊이 파고드는 후속(꼬리) 질문 1개를 만드세요.
+    return f"""{intro} \uc544\ub798\ub294 \uba74\uc811 \uc9c8\ubb38\uacfc \uc9c0\uc6d0\uc790\uc758 \ub2f5\ubcc0\uc785\ub2c8\ub2e4. \uc9c0\uc6d0\uc790\uc758 \ub2f5\ubcc0\uc744 \ubd84\uc11d\ud55c \ub4a4 \uc790\uc5f0\uc2a4\ub7ec\uc6b4 \ud6c4\uc18d(\uaf2c\ub9ac) \uc9c8\ubb38 1\uac1c\ub97c \ub9cc\ub4dc\uc138\uc694.
 
-규칙:
-- 답변에서 모호하거나 더 구체적으로 확인할 수 있는 지점을 짚을 것
-- 지원자가 실제로 한 말에 근거할 것 (없는 내용을 지어내지 말 것)
-- 한 문장으로 명확하게, 한국어로 작성
-- 사고 과정을 마친 뒤, 마지막에 JSON만 출력: {{"followup": "꼬리질문"}}
+[1\ub2e8\uacc4] \ub2f5\ubcc0\uc744 \uc18d\uc73c\ub85c \uc9c4\ub2e8\ud558\uc138\uc694: \uae38\uc774(\ucda9\ubd84/\ub108\ubb34 \uc9e7\uc74c), \uad6c\uccb4\uc131(\uad6c\uccb4\uc801 \uc0ac\ub840\u00b7\uc218\uce58\u00b7\uae30\uc220 vs \ub450\ub8e8\ubb49\uc2e4), \uadfc\uac70(\uc774\uc720 \uc81c\uc2dc \uc5ec\ubd80), \uae4a\uc774(\ud45c\uba74\uc801 vs \uae4a\uc74c).
+[2\ub2e8\uacc4] \uc9c4\ub2e8\uc5d0 \ub530\ub77c \uaf2c\ub9ac\uc9c8\ubb38\uc744 \ub2e4\ub974\uac8c \ub9cc\ub4dc\uc138\uc694:
+- \ub2f5\ubcc0\uc774 \uc9e7\uac70\ub098 \ub450\ub8e8\ubb49\uc2e4\ud558\uac70\ub098 \uadfc\uac70\uac00 \ubd80\uc871\ud558\uba74 -> \uad6c\uccb4\uc801\uc778 \uc0ac\ub840\u00b7\uc0c1\ud669\u00b7\uc218\uce58, \ub610\ub294 \uadf8\ub807\uac8c \ud55c \uc774\uc720\ub97c \uc9c1\uc811 \uc694\uad6c\ud558\uc138\uc694. (\uc608: \ubc29\uae08 '\uc801\ub2f9\ud788 \ud588\ub2e4'\uace0 \ud558\uc168\ub294\ub370, \uc5b4\ub5a4 \uae30\uc900\uc73c\ub85c \uacb0\uc815\ud558\uc168\uace0 \uc2e4\uc81c \uc608\ub97c \ub4e4\uc5b4\uc8fc\uc2e4 \uc218 \uc788\ub098\uc694?)
+- \ub2f5\ubcc0\uc774 \uad6c\uccb4\uc801\uc774\uace0 \ucda9\uc2e4\ud558\uba74 -> \ud55c \ub2e8\uacc4 \ub354 \uae4a\uc774 \ud30c\uace0\ub4dc\uc138\uc694: \uc120\ud0dd\ud55c \uc774\uc720, \ub2e4\ub978 \ubc29\ubc95\uacfc\uc758 \ube44\uad50, \ud2b8\ub808\uc774\ub4dc\uc624\ud504, \ud55c\uacc4 \uc0c1\ud669.
 
-[면접 질문]
+\uaddc\uce59:
+- \ubc18\ub4dc\uc2dc \uc9c0\uc6d0\uc790\uac00 \uc2e4\uc81c\ub85c \ud55c \ub9d0\uc5d0 \uadfc\uac70\ud560 \uac83 (\uc5c6\ub294 \ub0b4\uc6a9\uc744 \uc9c0\uc5b4\ub0b4\uc9c0 \ub9d0 \uac83)
+- \uae30\uc220 \uc6a9\uc5b4(Redux, React Query, JPA \ub4f1)\ub294 \uc6d0\ubb38(\uc601\ubb38) \uadf8\ub300\ub85c \ud45c\uae30\ud560 \uac83 (\uc74c\ucc28 \ubcc0\ud658 \uae08\uc9c0)
+- \ud55c \ubb38\uc7a5\uc73c\ub85c \uba85\ud655\ud558\uac8c, \ud55c\uad6d\uc5b4\ub85c \uc791\uc131
+- \uc0ac\uace0 \uacfc\uc815\uc744 \ub9c8\uce5c \ub4a4, \ub9c8\uc9c0\ub9c9\uc5d0 JSON\ub9cc \ucd9c\ub825: {{"followup": "\uaf2c\ub9ac\uc9c8\ubb38"}}
+
+{hist_ko}[\uba74\uc811 \uc9c8\ubb38]
 {question}
-
-[지원자 답변]
+[\uc9c0\uc6d0\uc790 \ub2f5\ubcc0]
 {answer}"""
-
 def report_lines(lang, results):
     lines = []
     for i, r in enumerate(results, 1):
@@ -381,7 +449,7 @@ class FollowupReq(BaseModel):
     answer: str
     persona: str = "default"
     lang: str = "ko"
-
+    history: list = []
 class ReportReq(BaseModel):
     results: list
     lang: str = "ko"
@@ -443,6 +511,86 @@ def evaluate(req: EvaluateReq):
         return {"ok": True, "evaluation": ev}
     return {"ok": False, "error": MSG[lang]["eval_fail"], "raw": gen[-1500:]}
 
+
+# ---- 스트리밍 채점 (SSE): 출력은 비스트리밍과 동일, 토큰만 실시간으로 흘려보냄 ----
+def _eval_stream_gen(prompt, prefill, use_adapter, lang):
+    from transformers import TextIteratorStreamer
+    msgs = [{"role": "user", "content": prompt}]
+    text = M["llm_tok"].apply_chat_template(msgs, tokenize=False, add_generation_prompt=True) + prefill
+    enc = M["llm_tok"](text, return_tensors="pt", add_special_tokens=False).to(M["llm"].device)
+    plen = enc["input_ids"].shape[1]
+    streamer = TextIteratorStreamer(M["llm_tok"], skip_prompt=True, skip_special_tokens=False)
+    holder = {}
+    def _gen():
+        try:
+            with torch.no_grad():
+                if use_adapter:
+                    holder["out"] = M["llm"].generate(**enc, max_new_tokens=4096, do_sample=False, streamer=streamer)
+                else:
+                    with M["llm"].disable_adapter():
+                        holder["out"] = M["llm"].generate(**enc, max_new_tokens=4096, do_sample=False, streamer=streamer)
+        except Exception as e:
+            holder["err"] = e
+    GEN_LOCK.acquire()                      # 비스트리밍과 같은 락으로 직렬화
+    t = threading.Thread(target=_gen, daemon=True)
+    t0 = time.time()
+    t.start()
+    full = []
+    try:
+        for chunk in streamer:
+            if not chunk:
+                continue
+            full.append(chunk)
+            piece = chunk
+            for _tok in ("[|endofturn|]", "[|assistant|]", "[|system|]", "[|user|]", "[|endoftext|]"):
+                piece = piece.replace(_tok, "")
+            if piece:
+                yield "data: " + json.dumps({"type": "token", "text": piece}, ensure_ascii=False) + "\n\n"
+        t.join()
+        if "err" in holder:
+            raise holder["err"]
+        gen_text = "".join(full)
+        out = holder.get("out")
+        if out is not None:
+            gl = int(out.shape[1] - plen); dt = time.time() - t0
+            print(f">>> [gen-stream] {gl}tok / {dt:.1f}s = {gl/max(dt,1e-9):.1f} tok/s (cap 4096, adapter={use_adapter})", flush=True)
+        ev = parse_json_lenient(gen_text)
+        if ev and isinstance(ev.get("scores"), dict):
+            ev["scores"] = clamp_scores(ev["scores"])
+            ev["overall"] = fix_overall(ev["scores"])
+            ev["display_scores"] = to_question_scores(ev["scores"])
+            payload = {"type": "done", "ok": True, "evaluation": ev}
+        else:
+            payload = {"type": "done", "ok": False, "error": MSG[lang]["eval_fail"]}
+        yield "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
+    except Exception as e:
+        yield "data: " + json.dumps({"type": "error", "error": f"{type(e).__name__}: {e}"}, ensure_ascii=False) + "\n\n"
+    finally:
+        if t.is_alive():
+            t.join()                        # 끊겨도 generate 끝까지 기다린 뒤 락 해제 (다음 요청과 GPU 충돌 방지)
+        try:
+            GEN_LOCK.release()
+        except RuntimeError:
+            pass
+
+@app.post("/interview/evaluate/stream")
+def evaluate_stream(req: EvaluateReq):
+    lang = norm_lang(req.lang)
+    sse_headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+    def _one(obj):
+        def _g():
+            yield "data: " + json.dumps(obj, ensure_ascii=False) + "\n\n"
+        return _g()
+    nr = not_ready(lang)
+    if nr:
+        return StreamingResponse(_one({"type": "error", "error": nr["error"]}), media_type="text/event-stream", headers=sse_headers)
+    err = vlen("question", req.question, lang) or vlen("answer", req.answer, lang)
+    if err:
+        return StreamingResponse(_one({"type": "error", "error": err}), media_type="text/event-stream", headers=sse_headers)
+    prompt = eval_prompt(lang, req.question, req.answer)
+    use_adapter = (lang == "ko")
+    return StreamingResponse(_eval_stream_gen(prompt, PREFILL[lang], use_adapter, lang), media_type="text/event-stream", headers=sse_headers)
+
 @app.post("/interview/generate")
 def generate_questions(req: GenerateReq):
     lang = norm_lang(req.lang)
@@ -453,7 +601,7 @@ def generate_questions(req: GenerateReq):
     n = max(1, min(15, req.n))
     intro = PERSONAS[lang].get(req.persona, PERSONAS[lang]["default"])
     prompt = gen_prompt(lang, intro, n, req.resume, req.job_posting)
-    gen = run_llm(prompt, GEN_PREFILL[lang], use_adapter=False, max_new_tokens=2048)
+    gen = run_llm(prompt, GEN_PREFILL[lang], use_adapter=False, max_new_tokens=2048, do_sample=True)
     d = parse_json_lenient(gen)
     if d and isinstance(d.get("questions"), list):
         return {"ok": True, "questions": d["questions"]}
@@ -467,8 +615,8 @@ def followup(req: FollowupReq):
     err = vlen("question", req.question, lang) or vlen("answer", req.answer, lang)
     if err: return {"ok": False, "error": err}
     intro = PERSONAS[lang].get(req.persona, PERSONAS[lang]["default"])
-    prompt = fu_prompt(lang, intro, req.question, req.answer)
-    gen = run_llm(prompt, FU_PREFILL[lang], use_adapter=False, max_new_tokens=1536)
+    prompt = fu_prompt(lang, intro, req.question, req.answer, req.history)
+    gen = run_llm(prompt, FU_PREFILL[lang], use_adapter=False, max_new_tokens=1536, do_sample=True)
     d = parse_json_lenient(gen)
     if d and "followup" in d:
         return {"ok": True, "followup": d.get("followup", "")}
@@ -628,7 +776,7 @@ def education_quiz(req: QuizReq):
         return {"ok": False, "error": err}
     n = max(1, min(10, req.n))
     prompt = quiz_prompt(lang, req.topic, n, req.difficulty)
-    gen = run_llm(prompt, QUIZ_PREFILL[lang], use_adapter=False, max_new_tokens=3072)
+    gen = run_llm(prompt, QUIZ_PREFILL[lang], use_adapter=False, max_new_tokens=3072, do_sample=True)
     parsed = parse_json_lenient(gen)
     items = _build_quiz_items(parsed, n)
     if items:
@@ -731,7 +879,7 @@ def resume_cover_letter(req: CoverLetterReq):
     if nr:
         return nr
     prompt = cover_letter_prompt(req, lang)
-    gen = run_llm(prompt, CL_PREFILL[lang], use_adapter=False, max_new_tokens=2560)
+    gen = run_llm(prompt, CL_PREFILL[lang], use_adapter=False, max_new_tokens=2560, do_sample=True)
     text = _strip_thought(gen)
     if not text:
         return {"ok": False, "error": MSG[lang]["gen_fail"], "raw": gen[-1500:]}
@@ -778,7 +926,7 @@ def resume_polish(req: PolishReq):
     if not (req.text or "").strip():
         return {"ok": False, "error": ("다듬을 텍스트를 입력하세요." if lang == "ko" else "Provide text to polish.")}
     prompt = polish_prompt(req, lang)
-    gen = run_llm(prompt, POLISH_PREFILL[lang], use_adapter=False, max_new_tokens=1024)
+    gen = run_llm(prompt, POLISH_PREFILL[lang], use_adapter=False, max_new_tokens=1024, do_sample=True)
     text = _strip_thought(gen)
     if not text:
         return {"ok": False, "error": MSG[lang]["gen_fail"], "raw": gen[-1500:]}
@@ -896,7 +1044,7 @@ def posting_generate(req: PostingGenReq):
     if nr:
         return nr
     prompt = posting_gen_prompt(req, lang)
-    gen = run_llm(prompt, POSTING_GEN_PREFILL[lang], use_adapter=False, max_new_tokens=2560)
+    gen = run_llm(prompt, POSTING_GEN_PREFILL[lang], use_adapter=False, max_new_tokens=2560, do_sample=True)
     posting = _build_posting(parse_json_lenient(gen))
     if posting:
         return {"ok": True, "lang": lang, "posting": posting}
@@ -969,3 +1117,164 @@ async def interview_stt(file: UploadFile = File(...), lang: str = Form("ko")):
 # ===== whisper 웜 스타트 =====
 import threading as _th
 _th.Thread(target=_stt.get_model, daemon=True, name="whisper-warmup").start()
+
+# ============================================================
+# /resume/analyze — 자소서/이력서 분석 (v5: 하이브리드 + 환각필터)
+#   점수 = 파이썬 휴리스틱, 질적 = LLM(점수주입+근거강제+고구체성 가드+후처리 필터)
+# ============================================================
+import re as _re_ra
+
+_RA_TECH = ["react","vue","angular","svelte","next.js","nuxt","typescript","javascript",
+    "node","express","nestjs","python","django","flask","fastapi","java","spring","kotlin",
+    "c++","c#","golang","rust","php","laravel","ruby","rails","sql","mysql","postgresql",
+    "postgres","mongodb","redis","graphql","rest","api","redux","mobx","zustand","recoil",
+    "tailwind","sass","webpack","vite","babel","docker","kubernetes","k8s","aws","gcp",
+    "azure","git","github","gitlab","jenkins","ci/cd","jest","cypress","playwright","html",
+    "css","jquery","websocket","oauth","jwt","kafka","rabbitmq","elasticsearch","nginx"]
+
+_RA_METRIC = ["감소","증가","단축","개선","향상","절감","달성","상승","하락","절약","축소","확대",
+    "reduced","increased","improved","decreased","achieved","boosted","cut","saved","grew",
+    "optimized","raised","lowered"]
+
+_RA_STAR = {
+    "S": ["상황","배경","문제","이슈","당시","현황","situation","problem","context","challenge","issue"],
+    "T": ["과제","목표","역할","담당","미션","task","goal","responsib","objective","mission","role"],
+    "A": ["주도","수행","구현","개발","적용","진행","도입","리팩","마이그","설계","구축","action",
+          "implement","led","built","develop","designed","migrat","refactor"],
+    "R": ["결과","성과","달성","개선","감소","증가","단축","절감","효과","result","achiev","improv",
+          "reduc","increas","impact","outcome"],
+}
+
+# 고구체성 문서에 대한 '지표 부족' 류 환각 약점을 거르는 키워드
+_RA_METRIC_KW = ["지표","수치","정량","계량","측정","metric","quantif"]
+_RA_LACK_KW = ["부족","부재","없","미흡","약함","lack","missing","absent","insufficient","limited"]
+
+def _ra_clamp(x, lo=1, hi=10):
+    return max(lo, min(hi, int(round(x))))
+
+def _ra_spec_score(text):
+    tl = text.lower()
+    nums = len(_re_ra.findall(r"\d+", text))
+    pcts = len(_re_ra.findall(r"%|퍼센트|percent", tl))
+    tech = sum(1 for t in _RA_TECH if t in tl)
+    metrics = sum(1 for m in _RA_METRIC if m in tl)
+    raw = min(nums, 8) + min(pcts, 5) * 2 + min(tech, 7) * 1.5 + min(metrics, 5)
+    return _ra_clamp(2 + raw * 0.45)
+
+def _ra_star_score(text):
+    tl = text.lower()
+    present = sum(1 for kws in _RA_STAR.values() if any(kw.lower() in tl for kw in kws))
+    base = {0: 1, 1: 3, 2: 5, 3: 7, 4: 8}[present]
+    if present >= 3 and _re_ra.search(r"\d", text):
+        base = min(10, base + 1)
+    return base
+
+def _ra_job_fit(doc, posting):
+    if not (posting or "").strip():
+        return 0
+    def _toks(s):
+        return set(_re_ra.findall(r"[A-Za-z가-힣]{2,}", s.lower()))
+    pt, dt = _toks(posting), _toks(doc)
+    if not pt:
+        return 0
+    return _ra_clamp(2 + (len(pt & dt) / len(pt)) * 10)
+
+def _ra_overall(spec, star, jobfit, has_posting):
+    if has_posting:
+        return _ra_clamp(0.4 * spec + 0.35 * star + 0.25 * jobfit)
+    return _ra_clamp(0.55 * spec + 0.45 * star)
+
+def _ra_filter_weaknesses(weaknesses, spec, lang):
+    # 구체성이 높은(>=8) 문서에 '정량 지표 부족' 류 약점이 달리면 모순 → 제거
+    if spec < 8 or not isinstance(weaknesses, list):
+        return weaknesses
+    kept = []
+    for w in weaknesses:
+        s = str(w).lower()
+        metric_lack = any(m in s for m in _RA_METRIC_KW) and any(l in s for l in _RA_LACK_KW)
+        if not metric_lack:
+            kept.append(w)
+    if not kept:
+        kept = ["내용의 깊이나 직무 연관성 측면에서 보강 여지" if lang == "ko"
+                else "Could deepen content or strengthen role-relevance"]
+    return kept
+
+RESUME_QUAL_PREFILL = {
+    "ko": "먼저 문서에 실제로 적힌 내용을 근거로 강점과 약점을 정리하겠습니다. ",
+    "en": "First, let me organize strengths and weaknesses grounded strictly in what the document states. ",
+}
+
+class ResumeAnalyzeReq(BaseModel):
+    document: str
+    job_posting: str = ""
+    role: str = ""
+    lang: str = "ko"
+
+def resume_qual_prompt(lang, document, job_posting, role, spec, star, jobfit, has_posting):
+    high = spec >= 8
+    if lang == "en":
+        role_line = f"\n- Target role: {role}" if role.strip() else ""
+        posting_line = f"\n\n[Job Posting]\n{job_posting}" if has_posting else ""
+        jf = f", job-fit {jobfit}/10" if has_posting else ""
+        hi = ("\n- IMPORTANT: This document has a HIGH specificity score (it already contains sufficient quantitative metrics). Do NOT write weaknesses like 'lacks metrics', 'insufficient numbers', or 'needs quantitative results'. Find weaknesses in depth of content, role-relevance, clarity of technical explanation, or differentiation instead." if high else "")
+        return f"""You are a career coach giving QUALITATIVE feedback on a candidate's resume/cover letter. (Scores are computed separately.)
+
+Auto-scores for THIS document (reference): specificity {spec}/10, STAR {star}/10{jf}. Your feedback MUST NOT contradict these.
+
+Rules:
+- Ground everything STRICTLY in what the document actually says. Do NOT invent content that is not there.{hi}
+- strengths (2-3), weaknesses (2-3), suggestions (2-3 actionable), summary (ONE sentence)
+- Output ONE complete JSON only. No markdown, no preamble.
+{{"strengths": ["item", "item"], "weaknesses": ["item", "item"], "suggestions": ["tip", "tip"], "summary": "one sentence"}}
+
+[Document]{role_line}
+{document}{posting_line}"""
+    else:
+        role_line = f"\n- 지원 직무: {role}" if role.strip() else ""
+        posting_line = f"\n\n[채용공고]\n{job_posting}" if has_posting else ""
+        jf = f", 공고 적합도 {jobfit}/10" if has_posting else ""
+        hi = ("\n- ★중요: 이 문서는 구체성 점수가 높습니다(이미 정량적 지표·수치가 충분함). '성과 지표 부족', '수치 부족', '정량적 결과 부족' 같은 약점은 절대 쓰지 마세요. 약점은 내용의 깊이, 직무 연관성, 기술 설명의 명확성, 차별성에서 찾으세요." if high else "")
+        return f"""당신은 지원자의 자소서/이력서에 질적 피드백을 주는 커리어 코치입니다. (점수는 별도로 계산됩니다.)
+
+이 문서의 자동 평가 점수(참고): 구체성 {spec}/10, STAR {star}/10{jf}. 피드백은 이 점수와 모순되면 안 됩니다.
+
+규칙:
+- 모든 내용을 문서에 실제로 적힌 것에만 근거하세요. 문서에 없는 내용을 지어내지 마세요.{hi}
+- strengths(강점 2~3개), weaknesses(약점 2~3개), suggestions(실행 가능한 개선 제안 2~3개), summary(한 문장 총평)
+- 완전한 JSON 하나만 출력. 마크다운·서론 금지.
+{{"strengths": ["항목", "항목"], "weaknesses": ["항목", "항목"], "suggestions": ["조언", "조언"], "summary": "한 문장 총평"}}
+
+[자소서/이력서]{role_line}
+{document}{posting_line}"""
+
+@app.post("/resume/analyze")
+def resume_analyze(req: ResumeAnalyzeReq):
+    lang = norm_lang(req.lang)
+    nr = not_ready(lang)
+    if nr:
+        return nr
+    doc_text = (req.document or "").strip()
+    if not doc_text:
+        return {"ok": False, "error": ("분석할 자소서/이력서를 입력하세요." if lang == "ko" else "Provide a resume/cover letter to analyze.")}
+    if len(doc_text) > 12000:
+        return {"ok": False, "error": ("자소서는 12,000자 이내여야 합니다." if lang == "ko" else "Resume must be under 12,000 characters.")}
+    has_posting = bool((req.job_posting or "").strip())
+    spec = _ra_spec_score(doc_text)
+    star = _ra_star_score(doc_text)
+    jobfit = _ra_job_fit(doc_text, req.job_posting)
+    overall = _ra_overall(spec, star, jobfit, has_posting)
+    prompt = resume_qual_prompt(lang, doc_text, req.job_posting, req.role, spec, star, jobfit, has_posting)
+    gen = run_llm(prompt, RESUME_QUAL_PREFILL[lang], use_adapter=False, max_new_tokens=1536, do_sample=False)
+    d = parse_json_lenient(gen) or {}
+    weaknesses = _ra_filter_weaknesses(d.get("weaknesses", []), spec, lang)
+    analysis = {
+        "overall_score": overall,
+        "specificity_score": spec,
+        "star_score": star,
+        "job_fit_score": jobfit,
+        "strengths": d.get("strengths", []),
+        "weaknesses": weaknesses,
+        "suggestions": d.get("suggestions", []),
+        "summary": d.get("summary", ""),
+    }
+    return {"ok": True, "lang": lang, "analysis": analysis}
