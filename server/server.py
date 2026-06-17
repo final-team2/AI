@@ -1699,3 +1699,181 @@ def leveltest_session_next(req: SessionDiffReq):
     return {"ok": True, "session_avg": avg,
             "current_difficulty": _LT_DIFF_KO[cur], "next_difficulty": _LT_DIFF_KO[nxt],
             "recommendation": rec, "recommendation_source": src}
+
+
+# ============================================================================
+#  학습 노트 생성 (AI Lesson)  — server.py 하단에 append
+#  - 커리큘럼 지도의 노드(토픽)를 누르면 그 자리에서 EXAONE이 '핵심 학습 노트'를 생성
+#  - RAG(면접 질문)로 '면접에서 실제로 묻는 개념' 중심으로 근거를 깔고, 범위는 요약으로 한정
+#  - <thought> 추론은 건너뛰고 본문만 스트리밍 (자소서 스트림과 동일 방식)
+#  - POST /education/lesson         : 비스트리밍 {ok, lesson, related}
+#  - POST /education/lesson/stream  : SSE (token... -> done{lesson, related})
+# ============================================================================
+
+LESSON_PREFILL = {
+    "ko": "먼저 이 주제에서 면접에 자주 나오는 핵심 개념과 흔한 실수를 추려, 학습자가 빠르게 이해할 수 있는 노트 구성을 생각하겠습니다. ",
+    "en": "First, let me identify the core concepts and common pitfalls of this topic that interviews focus on, and plan a concise study note. ",
+}
+
+def lesson_prompt(lang, topic, difficulty, related):
+    strong = [r for r in (related or []) if float(r.get("score", 0)) >= 0.60][:5]
+    rel = "\n".join("- " + str(r.get("question", "")).strip() for r in strong)
+    if not rel:
+        rel = ("(관련 질문 없음)" if lang != "en" else "(none)")
+    if lang == "en":
+        return f"""You are a developer learning coach. Write a CONCISE study note on the topic below at '{difficulty}' level, for interview preparation.
+
+Rules:
+- Cover ONLY: core concepts, must-know key points, and common mistakes. This is a summary note, NOT a full tutorial.
+- Focus ONLY on the [Topic] below. The related interview questions are just a hint for which concepts interviewers emphasize; do NOT cover anything unrelated to the [Topic] (e.g., other data structures or technologies).
+- Do NOT invent fake APIs, version numbers, or statistics. If unsure, stay general and correct.
+- Write in English, 2-4 short paragraphs (do not overuse markdown headers or long bullet dumps). About 250-350 words.
+
+[Topic] {topic}
+[Related interview questions]
+{rel}"""
+    return f"""당신은 개발자 학습 코치입니다. 아래 주제에 대해 난이도 '{difficulty}' 수준으로, 면접 준비용 '핵심 학습 노트'를 간결하게 작성하세요.
+
+규칙:
+- 다루는 범위: 핵심 개념 / 꼭 알아야 할 요점 / 흔히 하는 실수. 이것은 '요약 노트'이지 완전한 강의가 아닙니다.
+- 오직 아래 [주제]에만 집중하세요. '관련 면접 질문'은 그 주제에서 어떤 개념이 면접에 자주 나오는지 참고하는 용도이며, [주제]와 직접 관련 없는 질문(다른 자료구조·다른 기술 등)은 절대 다루지 마세요.
+- 사실이 아닌 API·버전·수치를 지어내지 마세요. 확실하지 않으면 일반적이고 정확하게 쓰세요.
+- 한국어로, 2~4개의 짧은 단락으로 정리하세요(마크다운 헤더 남발 금지, 긴 불릿 나열 금지). 약 400~600자.
+
+[주제] {topic}
+[관련 면접 질문]
+{rel}"""
+
+def _lesson_related(topic, lang, k=6):
+    """RAG: 토픽 관련 면접 질문 검색(근거+UI 표시용). 실패해도 빈 리스트로 진행."""
+    try:
+        if lang == "en" and "index_en" in M and "records_en" in M:
+            index, records = M["index_en"], M["records_en"]
+        else:
+            index, records = M["index"], M["records"]
+        scores, ids = index.search(embed_query(topic), k)
+        return [{"question": records[i]["question"], "score": float(s)}
+                for s, i in zip(scores[0], ids[0]) if i >= 0]
+    except Exception as e:
+        print(f">>> [lesson] RAG retrieval skipped: {e}", flush=True)
+        return []
+
+_LESSON_SPECIAL = ("[|endofturn|]", "[|assistant|]", "[|system|]", "[|user|]", "[|endoftext|]")
+def _lesson_strip_special(s):
+    for _t in _LESSON_SPECIAL:
+        s = s.replace(_t, "")
+    return s
+
+def _lesson_body_pieces(chunks):
+    """청크 스트림에서 </thought> 이후 '본문'만 조각으로 내보냄(추론은 숨김)."""
+    passed = False
+    buf = ""
+    for chunk in chunks:
+        if not chunk:
+            continue
+        if passed:
+            piece = _lesson_strip_special(chunk)
+            if piece:
+                yield piece
+        else:
+            buf += chunk
+            if "</thought>" in buf:
+                passed = True
+                after = _lesson_strip_special(buf.split("</thought>", 1)[1]).lstrip("\n")
+                if after:
+                    yield after
+
+def _lesson_tee(it, sink):
+    for c in it:
+        sink.append(c)
+        yield c
+
+def _lesson_stream_gen(prompt, prefill, lang, related):
+    from transformers import TextIteratorStreamer
+    msgs = [{"role": "user", "content": prompt}]
+    text = M["llm_tok"].apply_chat_template(msgs, tokenize=False, add_generation_prompt=True) + prefill
+    enc = M["llm_tok"](text, return_tensors="pt", add_special_tokens=False).to(M["llm"].device)
+    plen = enc["input_ids"].shape[1]
+    streamer = TextIteratorStreamer(M["llm_tok"], skip_prompt=True, skip_special_tokens=False)
+    holder = {}
+    def _gen():
+        try:
+            with torch.no_grad():
+                with M["llm"].disable_adapter():     # 개념 설명은 base 모델
+                    holder["out"] = M["llm"].generate(**enc, max_new_tokens=2048,
+                                                       do_sample=False, streamer=streamer)
+        except Exception as e:
+            holder["err"] = e
+    GEN_LOCK.acquire()
+    t = threading.Thread(target=_gen, daemon=True)
+    t0 = time.time()
+    t.start()
+    full = []
+    try:
+        for piece in _lesson_body_pieces(_lesson_tee(streamer, full)):
+            yield "data: " + json.dumps({"type": "token", "text": piece}, ensure_ascii=False) + "\n\n"
+        t.join()
+        if "err" in holder:
+            raise holder["err"]
+        body = _strip_thought("".join(full))
+        out = holder.get("out")
+        if out is not None:
+            gl = int(out.shape[1] - plen); dt = time.time() - t0
+            print(f">>> [lesson-stream] {gl}tok / {dt:.1f}s = {gl/max(dt,1e-9):.1f} tok/s", flush=True)
+        yield "data: " + json.dumps({"type": "done", "ok": True, "lesson": body, "related": related},
+                                     ensure_ascii=False) + "\n\n"
+    except Exception as e:
+        yield "data: " + json.dumps({"type": "error", "error": f"{type(e).__name__}: {e}"},
+                                    ensure_ascii=False) + "\n\n"
+    finally:
+        if t.is_alive():
+            t.join()
+        try:
+            GEN_LOCK.release()
+        except RuntimeError:
+            pass
+
+
+class LessonReq(BaseModel):
+    topic: str
+    difficulty: str = "중"     # 하 / 중 / 상
+    lang: str = "ko"
+
+@app.post("/education/lesson")
+def education_lesson(req: LessonReq):
+    lang = norm_lang(req.lang)
+    nr = not_ready(lang)
+    if nr:
+        return nr
+    err = vlen("topic", req.topic, lang)
+    if err:
+        return {"ok": False, "error": err}
+    related = _lesson_related(req.topic, lang)
+    prompt = lesson_prompt(lang, req.topic, req.difficulty, related)
+    gen = run_llm(prompt, LESSON_PREFILL[lang], use_adapter=False, max_new_tokens=2048, do_sample=False)
+    body = _strip_thought(gen)
+    if body and len(body) >= 20:
+        return {"ok": True, "topic": req.topic, "difficulty": req.difficulty,
+                "lesson": body, "related": related}
+    return {"ok": False, "error": "학습 노트 생성 실패", "raw": gen[-1000:]}
+
+@app.post("/education/lesson/stream")
+def education_lesson_stream(req: LessonReq):
+    lang = norm_lang(req.lang)
+    sse_headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+    def _one(obj):
+        def _g():
+            yield "data: " + json.dumps(obj, ensure_ascii=False) + "\n\n"
+        return _g()
+    nr = not_ready(lang)
+    if nr:
+        return StreamingResponse(_one({"type": "error", "error": nr["error"]}),
+                                 media_type="text/event-stream", headers=sse_headers)
+    err = vlen("topic", req.topic, lang)
+    if err:
+        return StreamingResponse(_one({"type": "error", "error": err}),
+                                 media_type="text/event-stream", headers=sse_headers)
+    related = _lesson_related(req.topic, lang)
+    prompt = lesson_prompt(lang, req.topic, req.difficulty, related)
+    return StreamingResponse(_lesson_stream_gen(prompt, LESSON_PREFILL[lang], lang, related),
+                             media_type="text/event-stream", headers=sse_headers)
