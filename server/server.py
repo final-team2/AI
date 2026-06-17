@@ -8,7 +8,7 @@ from transformers import AutoTokenizer, AutoModel, AutoModelForCausalLM, BitsAnd
 from peft import PeftModel
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse, FileResponse
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
@@ -468,6 +468,30 @@ def health():
         if torch.cuda.is_available():
             info["gpu_memory_gb"] = round(torch.cuda.memory_allocated() / 1024**3, 2)
     return info
+
+# ---- 데모 페이지(single HTML) same-origin 서빙 ----
+# 공개URL/ 로 접속하면 데모와 API가 동일 출처(same-origin)라 CORS 문제 없음.
+# server.py 위치를 기준으로 demo/index.html을 여러 후보 경로에서 탐색(레포/플랫 배포 모두 호환).
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_DEMO_CANDIDATES = [
+    os.path.join(_HERE, "demo", "index.html"),         # server.py 와 같은 폴더의 demo/
+    os.path.join(_HERE, "..", "demo", "index.html"),   # 레포 루트의 demo/ (server/ 의 상위)
+    os.path.join(_HERE, "index.html"),                 # server.py 옆에 평탄화된 경우
+]
+
+def _demo_path():
+    for p in _DEMO_CANDIDATES:
+        if os.path.isfile(p):
+            return p
+    return None
+
+@app.get("/")
+def demo_index():
+    p = _demo_path()
+    if p:
+        return FileResponse(p, media_type="text/html; charset=utf-8")
+    return JSONResponse(status_code=404, content={"ok": False,
+        "error": "demo/index.html을 찾을 수 없습니다. server.py 와 같은 위치(또는 상위)에 demo/index.html을 두세요."})
 
 @app.get("/interview/personas")
 def list_personas(lang: str = "ko"):
@@ -1278,3 +1302,400 @@ def resume_analyze(req: ResumeAnalyzeReq):
         "summary": d.get("summary", ""),
     }
     return {"ok": True, "lang": lang, "analysis": analysis}
+
+
+# ===== 자기소개서 자동 작성 (스트리밍) — /resume/cover-letter/stream =====
+def _coverletter_stream_gen(prompt, prefill, lang):
+    from transformers import TextIteratorStreamer
+    msgs = [{"role": "user", "content": prompt}]
+    text = M["llm_tok"].apply_chat_template(msgs, tokenize=False, add_generation_prompt=True) + prefill
+    enc = M["llm_tok"](text, return_tensors="pt", add_special_tokens=False).to(M["llm"].device)
+    streamer = TextIteratorStreamer(M["llm_tok"], skip_prompt=True, skip_special_tokens=False)
+    holder = {}
+    def _gen():
+        try:
+            with torch.no_grad():
+                with M["llm"].disable_adapter():
+                    holder["out"] = M["llm"].generate(
+                        **enc, max_new_tokens=2560, do_sample=True,
+                        temperature=0.8, top_p=0.9, streamer=streamer)
+        except Exception as e:
+            holder["err"] = e
+    GEN_LOCK.acquire()
+    t = threading.Thread(target=_gen, daemon=True)
+    t.start()
+    full, buf, started = [], "", False
+    try:
+        for chunk in streamer:
+            if not chunk:
+                continue
+            full.append(chunk)
+            piece = chunk
+            for _tok in ("[|endofturn|]", "[|assistant|]", "[|system|]", "[|user|]", "[|endoftext|]"):
+                piece = piece.replace(_tok, "")
+            if not piece:
+                continue
+            if started:
+                yield "data: " + json.dumps({"type": "token", "text": piece}, ensure_ascii=False) + "\n\n"
+            else:
+                buf += piece
+                k = buf.find("</thought>")
+                if k >= 0:
+                    started = True
+                    after = buf[k + len("</thought>"):].lstrip()
+                    if after:
+                        yield "data: " + json.dumps({"type": "token", "text": after}, ensure_ascii=False) + "\n\n"
+                    buf = ""
+        t.join()
+        if "err" in holder:
+            raise holder["err"]
+        cover = _strip_thought("".join(full))
+        payload = {"type": "done", "ok": True, "cover_letter": cover} if cover \
+            else {"type": "done", "ok": False, "error": MSG[lang]["gen_fail"]}
+        yield "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
+    except Exception as e:
+        yield "data: " + json.dumps({"type": "error", "error": f"{type(e).__name__}: {e}"}, ensure_ascii=False) + "\n\n"
+    finally:
+        if t.is_alive():
+            t.join()
+        try:
+            GEN_LOCK.release()
+        except RuntimeError:
+            pass
+
+
+@app.post("/resume/cover-letter/stream")
+def resume_cover_letter_stream(req: CoverLetterReq):
+    lang = norm_lang(req.lang)
+    sse_headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+    def _one(obj):
+        def _g():
+            yield "data: " + json.dumps(obj, ensure_ascii=False) + "\n\n"
+        return _g()
+    nr = not_ready(lang)
+    if nr:
+        return StreamingResponse(_one({"type": "error", "error": nr["error"]}), media_type="text/event-stream", headers=sse_headers)
+    prompt = cover_letter_prompt(req, lang)
+    return StreamingResponse(_coverletter_stream_gen(prompt, CL_PREFILL[lang], lang), media_type="text/event-stream", headers=sse_headers)
+
+
+# ============================================================================
+#  적응형 레벨테스트 (Adaptive Level Test)  — server.py 하단에 append
+#  설계: 난이도 숫자/문항 선택 = 규칙(stateless, 환각 0)
+#        추천 텍스트 = base EXAONE(계산된 결과 수치만 근거, 후처리 폴백)
+#  - POST /leveltest/next          : 객관식 적응 루프(즉시채점→문항마다 난이도 변경)
+#  - POST /leveltest/session-next  : 서술형 면접 세션 점수 → 다음 난이도 + 로드맵
+#  상태는 요청에 실려 옴(프론트 보관) → 서버 무상태. qid만 주고받아 정답은 서버에만.
+# ============================================================================
+
+# ---- 내장 객관식 문제 은행 (topic: fe/be/cs, diff: 1=하 2=중 3=상) ----
+# answer = options 내 정답 인덱스. (정답 위치는 문항마다 분산)
+_LT_BANK = [
+    # ===== 난이도 1 (하/기초) =====
+    {"qid":"q101","topic":"fe","diff":1,"q":"HTML에서 가장 큰 제목을 나타내는 태그는?",
+     "options":["<head>","<h1>","<h6>","<title>"],"answer":1,
+     "explanation":"<h1>이 최상위(가장 큰) 제목 태그이며 <h6>로 갈수록 작아집니다."},
+    {"qid":"q102","topic":"fe","diff":1,"q":"CSS에서 글자 색을 지정하는 속성은?",
+     "options":["background","font-size","color","text"],"answer":2,
+     "explanation":"글자 색은 color 속성으로 지정합니다."},
+    {"qid":"q103","topic":"be","diff":1,"q":"HTTP 상태 코드 404가 의미하는 것은?",
+     "options":["요청한 리소스 없음","서버 내부 오류","정상 처리","권한 없음"],"answer":0,
+     "explanation":"404 Not Found는 요청한 리소스를 찾을 수 없음을 뜻합니다."},
+    {"qid":"q104","topic":"be","diff":1,"q":"SQL에서 데이터를 조회하는 명령은?",
+     "options":["INSERT","SELECT","DELETE","UPDATE"],"answer":1,
+     "explanation":"SELECT는 데이터를 조회(읽기)하는 명령입니다."},
+    {"qid":"q105","topic":"cs","diff":1,"q":"2진수 1010을 10진수로 바꾸면?",
+     "options":["8","5","12","10"],"answer":3,
+     "explanation":"1010(2) = 8+0+2+0 = 10 입니다."},
+    {"qid":"q106","topic":"cs","diff":1,"q":"1바이트(byte)는 몇 비트(bit)인가?",
+     "options":["4비트","8비트","16비트","1024비트"],"answer":1,
+     "explanation":"1바이트는 8비트입니다."},
+    {"qid":"q107","topic":"fe","diff":1,"q":"웹페이지의 '구조'를 담당하는 언어는?",
+     "options":["CSS","JavaScript","HTML","SQL"],"answer":2,
+     "explanation":"HTML은 구조, CSS는 스타일, JavaScript는 동작을 담당합니다."},
+    {"qid":"q108","topic":"be","diff":1,"q":"REST API에서 새 데이터 '생성'에 주로 쓰는 HTTP 메서드는?",
+     "options":["GET","POST","DELETE","PATCH"],"answer":1,
+     "explanation":"POST는 새 리소스 생성에 주로 사용됩니다."},
+    {"qid":"q109","topic":"fe","diff":1,"q":"다음 중 JavaScript의 '변수 선언' 키워드가 아닌 것은?",
+     "options":["let","const","function","var"],"answer":2,
+     "explanation":"let/const/var가 변수 선언 키워드이며 function은 함수 선언 키워드입니다."},
+    {"qid":"q110","topic":"cs","diff":1,"q":"프로그램 실행 중 데이터를 임시로 저장하는 휘발성 메모리는?",
+     "options":["HDD","RAM","SSD","ROM"],"answer":1,
+     "explanation":"RAM은 실행 중 임시 데이터를 담는 휘발성 주기억장치입니다."},
+
+    # ===== 난이도 2 (중) =====
+    {"qid":"q201","topic":"fe","diff":2,"q":"React에서 컴포넌트의 '상태'를 관리하는 기본 Hook은?",
+     "options":["useEffect","useState","useMemo","useContext"],"answer":1,
+     "explanation":"useState는 컴포넌트 상태값과 갱신 함수를 제공합니다."},
+    {"qid":"q202","topic":"fe","diff":2,"q":"CSS Flexbox에서 '주축(main axis)' 방향 정렬 속성은?",
+     "options":["align-items","justify-content","flex-wrap","order"],"answer":1,
+     "explanation":"justify-content는 주축 정렬, align-items는 교차축 정렬입니다."},
+    {"qid":"q203","topic":"be","diff":2,"q":"관계형 DB에서 두 테이블을 연결하는 데 쓰는 키는?",
+     "options":["기본 키","후보 키","외래 키","슈퍼 키"],"answer":2,
+     "explanation":"외래 키(Foreign Key)는 다른 테이블의 기본 키를 참조해 연결합니다."},
+    {"qid":"q204","topic":"be","diff":2,"q":"JS에서 비동기 작업의 '미래 결과'를 표현하기 위해 반환되는 객체는?",
+     "options":["Promise","Callback","Array","Object"],"answer":0,
+     "explanation":"Promise는 비동기 작업의 완료/실패와 결과를 표현합니다."},
+    {"qid":"q205","topic":"cs","diff":2,"q":"스택(Stack)의 데이터 처리 방식은?",
+     "options":["FIFO(선입선출)","LIFO(후입선출)","우선순위 순","무작위"],"answer":1,
+     "explanation":"스택은 마지막에 넣은 것이 먼저 나오는 LIFO 구조입니다."},
+    {"qid":"q206","topic":"cs","diff":2,"q":"시간복잡도 O(log n)에 해당하는 대표적인 알고리즘은?",
+     "options":["선형 탐색","버블 정렬","이진 탐색","완전 탐색"],"answer":2,
+     "explanation":"정렬된 배열에서의 이진 탐색은 O(log n)입니다."},
+    {"qid":"q207","topic":"fe","diff":2,"q":"다른 출처(도메인)로의 브라우저 요청을 허용·제어하는 메커니즘은?",
+     "options":["CORS","CSRF","XSS","JWT"],"answer":0,
+     "explanation":"CORS(교차 출처 리소스 공유)는 다른 출처 요청 허용 정책을 정의합니다."},
+    {"qid":"q208","topic":"be","diff":2,"q":"같은 요청을 여러 번 보내도 결과가 동일하게 유지되는 성질은?",
+     "options":["원자성","멱등성","일관성","지속성"],"answer":1,
+     "explanation":"멱등성(idempotent)은 동일 요청을 반복해도 상태 변화가 같음을 뜻합니다(예: PUT, DELETE)."},
+    {"qid":"q209","topic":"cs","diff":2,"q":"DB 트랜잭션의 ACID 중 '전부 반영 아니면 전부 취소'를 뜻하는 것은?",
+     "options":["일관성","원자성","격리성","지속성"],"answer":1,
+     "explanation":"원자성(Atomicity)은 트랜잭션이 전부 실행되거나 전혀 실행되지 않음을 보장합니다."},
+    {"qid":"q210","topic":"be","diff":2,"q":"HTTP에서 '리소스를 부분 수정'할 때 의미상 적절한 메서드는?",
+     "options":["GET","PATCH","HEAD","OPTIONS"],"answer":1,
+     "explanation":"PATCH는 리소스의 일부만 수정할 때 사용합니다(전체 교체는 PUT)."},
+
+    # ===== 난이도 3 (상) =====
+    {"qid":"q301","topic":"fe","diff":3,"q":"React에서 함수를 메모이제이션해 불필요한 재생성을 막는 Hook은?",
+     "options":["useState","useCallback","useEffect","useReducer"],"answer":1,
+     "explanation":"useCallback은 의존성이 같으면 같은 함수 참조를 유지해 재생성을 막습니다."},
+    {"qid":"q302","topic":"be","diff":3,"q":"범위 검색에 유리해 DB 인덱스로 널리 쓰이는 자료구조는?",
+     "options":["해시 테이블","B-Tree","연결 리스트","스택"],"answer":1,
+     "explanation":"B-Tree(B+Tree)는 정렬을 유지해 범위 검색·정렬 조회에 유리합니다."},
+    {"qid":"q303","topic":"cs","diff":3,"q":"교착상태(Deadlock)의 4가지 '필요조건'이 아닌 것은?",
+     "options":["상호 배제","점유와 대기","선점 가능","순환 대기"],"answer":2,
+     "explanation":"교착상태는 '비선점'이 조건입니다. 자원을 선점할 수 있으면 교착이 풀립니다."},
+    {"qid":"q304","topic":"be","diff":3,"q":"분산 시스템에서 일관성·가용성·분단내성을 동시에 만족할 수 없다는 이론은?",
+     "options":["ACID","CAP 정리","BASE","SOLID"],"answer":1,
+     "explanation":"CAP 정리는 네트워크 분단 시 일관성과 가용성 중 하나를 포기해야 함을 말합니다."},
+    {"qid":"q305","topic":"fe","diff":3,"q":"브라우저 렌더링에서 레이아웃을 다시 계산하는, 비용이 큰 작업은?",
+     "options":["리페인트","리플로우","컴포지팅","하이드레이션"],"answer":1,
+     "explanation":"리플로우(레이아웃 재계산)는 리페인트보다 비용이 큽니다."},
+    {"qid":"q306","topic":"cs","diff":3,"q":"TCP 3-way handshake의 올바른 순서는?",
+     "options":["ACK → SYN → FIN","SYN → SYN-ACK → ACK","FIN → ACK → SYN","SYN → ACK → FIN"],"answer":1,
+     "explanation":"연결 수립은 SYN → SYN-ACK → ACK 순서로 이뤄집니다."},
+    {"qid":"q307","topic":"be","diff":3,"q":"한 트랜잭션이 '아직 커밋되지 않은' 데이터를 읽는 동시성 문제는?",
+     "options":["Dirty Read","Phantom Read","Non-repeatable Read","Lost Update"],"answer":0,
+     "explanation":"Dirty Read는 커밋 전 데이터를 읽어 롤백 시 오류가 되는 문제입니다."},
+    {"qid":"q308","topic":"fe","diff":3,"q":"JS 이벤트 루프에서 Promise의 then 콜백이 들어가는 큐는?",
+     "options":["매크로태스크 큐","마이크로태스크 큐","콜 스택","렌더 큐"],"answer":1,
+     "explanation":"Promise 콜백은 마이크로태스크 큐에 들어가 매크로태스크보다 먼저 처리됩니다."},
+    {"qid":"q309","topic":"cs","diff":3,"q":"다음 중 '해시 충돌' 해결 방법이 아닌 것은?",
+     "options":["체이닝","개방 주소법","이진 탐색","이중 해싱"],"answer":2,
+     "explanation":"이진 탐색은 충돌 해결법이 아닙니다(체이닝·개방주소법·이중해싱이 해당)."},
+    {"qid":"q310","topic":"be","diff":3,"q":"쓰기 시 캐시와 DB를 '동시에' 갱신하는 캐시 전략은?",
+     "options":["Write-Back","Write-Through","Cache-Aside","Write-Around"],"answer":1,
+     "explanation":"Write-Through는 캐시와 DB를 동시에 갱신해 일관성이 높습니다(쓰기 지연은 큼)."},
+]
+_LT_BY_QID = {it["qid"]: it for it in _LT_BANK}
+_LT_TOTAL = 8                      # 한 회 레벨테스트 문항 수
+_LT_DIFF_KO = {1: "하", 2: "중", 3: "상"}
+
+def _lt_topics_for(role):
+    r = (role or "").lower()
+    if "front" in r or "프론트" in r:  return ["fe", "cs"]
+    if "back" in r or "백엔드" in r:   return ["be", "cs"]
+    return ["fe", "be", "cs"]          # 풀스택/미지정
+
+def _lt_next_diff(cur, correct):
+    """규칙: 맞으면 +1, 틀리면 -1 (1~3 클램프). 환각 없음."""
+    return max(1, min(3, cur + (1 if correct else -1)))
+
+def _lt_pick(target, topics, used, step):
+    """target 난이도·허용 토픽·미사용 중에서 결정론적으로 1개 선택(없으면 인접 난이도로 완화)."""
+    order = [target] + sorted([1, 2, 3], key=lambda d: abs(d - target))
+    seen = set()
+    for d in order:
+        if d in seen:
+            continue
+        seen.add(d)
+        cand = [it for it in _LT_BANK
+                if it["diff"] == d and it["topic"] in topics and it["qid"] not in used]
+        if not cand:
+            continue
+        cand.sort(key=lambda it: it["qid"])
+        return cand[(step * 7 + target) % len(cand)]   # 상태로부터 결정론적 → 재생성 시 동일
+    # 토픽 무시하고라도 아무거나
+    cand = [it for it in _LT_BANK if it["qid"] not in used]
+    cand.sort(key=lambda it: it["qid"])
+    return cand[step % len(cand)] if cand else None
+
+def _lt_replay(profile, answers):
+    """제출된 answers(qid·chosen)를 은행으로 채점하며 난이도 경로를 재구성(무상태)."""
+    topics = _lt_topics_for(profile.get("role"))
+    cur = 2                       # 시작 난이도 '중'
+    graded, used, path = [], set(), []
+    for a in answers:
+        qid = str((a or {}).get("qid") or "")
+        it = _LT_BY_QID.get(qid)
+        if not it:
+            continue
+        chosen = (a or {}).get("chosen", -1)
+        try:
+            chosen = int(chosen)
+        except (TypeError, ValueError):
+            chosen = -1
+        correct = (chosen == it["answer"])
+        path.append(cur)
+        graded.append({"qid": qid, "topic": it["topic"], "diff": it["diff"],
+                       "chosen": chosen, "answer": it["answer"], "correct": correct,
+                       "explanation": it["explanation"]})
+        used.add(qid)
+        cur = _lt_next_diff(cur, correct)
+    return topics, cur, graded, used, path
+
+def _lt_level_label(acc, diff_reached):
+    """정답률 + 도달 난이도 → 레벨 라벨(규칙)."""
+    if acc >= 0.85 and diff_reached >= 3:   return "고급"
+    if acc >= 0.65 and diff_reached >= 2:   return "중급"
+    if acc >= 0.45:                          return "초급"
+    return "입문"
+
+def _lt_summary(graded):
+    n = len(graded)
+    correct = sum(1 for g in graded if g["correct"])
+    acc = (correct / n) if n else 0.0
+    diff_reached = max((g["diff"] for g in graded if g["correct"]), default=1)
+    by = {}
+    for g in graded:
+        t = g["topic"]; by.setdefault(t, [0, 0])
+        by[t][1] += 1
+        if g["correct"]:
+            by[t][0] += 1
+    by_topic = {t: round(c / max(tot, 1), 2) for t, (c, tot) in by.items()}
+    weak = sorted([t for t, r in by_topic.items() if r < 0.6], key=lambda t: by_topic[t])
+    label = _lt_level_label(acc, diff_reached)
+    return {"level": label, "accuracy": round(acc, 2), "correct": correct, "total": n,
+            "difficulty_reached": _LT_DIFF_KO.get(diff_reached, "중"),
+            "by_topic": by_topic, "weak_topics": weak}
+
+_LT_TOPIC_KO = {"fe": "프론트엔드", "be": "백엔드", "cs": "CS 기초/공통"}
+
+def _lt_fallback_rec(stats):
+    """LLM 실패/미준비 시 쓰는 규칙 기반 추천(항상 사실에 근거)."""
+    weak = stats.get("weak_topics") or []
+    if weak:
+        w = ", ".join(_LT_TOPIC_KO.get(t, t) for t in weak)
+        focus = f"특히 {w} 영역의 정답률이 낮으니 이 부분을 우선 보강하세요. "
+    else:
+        focus = "전반적으로 고른 편입니다. 한 단계 높은 난이도로 도전해 보세요. "
+    return (f"현재 레벨은 '{stats['level']}'(정답률 {int(stats['accuracy']*100)}%, "
+            f"도달 난이도 '{stats['difficulty_reached']}')입니다. {focus}"
+            f"다음 단계로는 약점 주제의 개념을 정리한 뒤, 같은 난이도 문제로 정답률을 끌어올리고 "
+            f"안정되면 난이도를 한 칸 올리는 순서를 권합니다.")
+
+LT_PREFILL = {
+    "ko": "먼저 이 학습자의 레벨테스트 결과(정답률·약점 토픽·도달 난이도)를 살펴보고, 가장 도움이 될 다음 학습 방향을 생각하겠습니다. ",
+    "en": "First, let me review this learner's level-test results (accuracy, weak topics, difficulty reached) and plan the most helpful next learning steps. ",
+}
+
+def _lt_ai_recommend(profile, stats, lang):
+    """base EXAONE로 로드맵 추천 생성. 계산된 수치만 근거로 강제. 실패하면 규칙 폴백."""
+    try:
+        by = ", ".join(f"{_LT_TOPIC_KO.get(t,t)} {int(r*100)}%" for t, r in (stats.get("by_topic") or {}).items())
+        weak = ", ".join(_LT_TOPIC_KO.get(t, t) for t in (stats.get("weak_topics") or [])) or "없음"
+        role = profile.get("role") or "미지정"
+        langs = ", ".join(profile.get("languages") or []) or "미지정"
+        prompt = (
+            "당신은 개발자 학습 코치입니다. 아래 '레벨테스트 결과 수치'만 근거로, 다음 학습 로드맵을 한국어 3~4문장으로 제시하세요.\n"
+            "절대 규칙: 아래에 없는 점수·수치·통계를 새로 지어내지 마세요. 약점 주제를 먼저 보강하는 방향으로, 다음에 풀 난이도도 한 단계 제안하세요.\n\n"
+            f"[지원자] 희망직군: {role} / 사용언어: {langs}\n"
+            f"[레벨] {stats['level']} (정답률 {int(stats['accuracy']*100)}%, 도달 난이도 '{stats['difficulty_reached']}')\n"
+            f"[주제별 정답률] {by}\n"
+            f"[약점 주제] {weak}\n"
+        )
+        gen = run_llm(prompt, LT_PREFILL.get(lang, LT_PREFILL["ko"]),
+                      use_adapter=False, max_new_tokens=1024, do_sample=False)
+        body = _strip_thought(gen).strip()
+        # 후처리 가드: 비었거나 너무 짧으면(생성 실패로 간주) 규칙 폴백
+        if len(body) < 30:
+            return _lt_fallback_rec(stats), "fallback"
+        return body, "llm"
+    except Exception as e:
+        print(f">>> [leveltest] recommend fallback: {e}", flush=True)
+        return _lt_fallback_rec(stats), "fallback"
+
+
+class LevelTestReq(BaseModel):
+    profile: dict = {}        # {role, career, goal, languages:[...]}
+    answers: list = []        # [{qid, chosen}] 지금까지 제출한 답(빈 배열이면 첫 문항 요청)
+    lang: str = "ko"
+
+@app.post("/leveltest/next")
+def leveltest_next(req: LevelTestReq):
+    lang = norm_lang(req.lang)
+    profile = req.profile if isinstance(req.profile, dict) else {}
+    answers = req.answers if isinstance(req.answers, list) else []
+
+    topics, cur, graded, used, _path = _lt_replay(profile, answers)
+    prev = None
+    if graded:
+        g = graded[-1]
+        prev = {"correct": g["correct"], "answer": g["answer"], "explanation": g["explanation"]}
+
+    # 종료 조건
+    if len(graded) >= _LT_TOTAL:
+        stats = _lt_summary(graded)
+        nr = not_ready(lang)               # 추천에 LLM 필요 → 미준비면 규칙 폴백
+        if nr:
+            rec, src = _lt_fallback_rec(stats), "fallback"
+        else:
+            rec, src = _lt_ai_recommend(profile, stats, lang)
+        stats["recommendation"] = rec
+        stats["recommendation_source"] = src
+        return {"ok": True, "done": True, "total": _LT_TOTAL, "prev": prev, "result": stats}
+
+    # 다음 문항 선택(규칙·결정론적)
+    nxt = _lt_pick(cur, topics, used, len(graded))
+    if not nxt:
+        stats = _lt_summary(graded)
+        stats["recommendation"] = _lt_fallback_rec(stats)
+        stats["recommendation_source"] = "fallback"
+        return {"ok": True, "done": True, "total": len(graded), "prev": prev,
+                "result": stats, "note": "문제 은행 소진"}
+    return {"ok": True, "done": False, "q_no": len(graded) + 1, "total": _LT_TOTAL,
+            "difficulty": _LT_DIFF_KO[cur], "prev": prev,
+            "question": {"qid": nxt["qid"], "q": nxt["q"], "options": nxt["options"]}}
+
+
+# ---- 서술형 면접 세션 → 다음 난이도 + 로드맵 (둘 다 준비: 세션 단위 적응) ----
+class SessionDiffReq(BaseModel):
+    scores: dict = {}         # 5축 점수(0~100): technical_accuracy/logic/specificity/depth/communication 등
+    current_difficulty: str = "중"   # 하/중/상
+    profile: dict = {}
+    lang: str = "ko"
+
+_SD_ORDER = {"하": 1, "중": 2, "상": 3}
+
+@app.post("/leveltest/session-next")
+def leveltest_session_next(req: SessionDiffReq):
+    lang = norm_lang(req.lang)
+    scores = req.scores if isinstance(req.scores, dict) else {}
+    profile = req.profile if isinstance(req.profile, dict) else {}
+    vals = []
+    for v in scores.values():
+        try:
+            vals.append(max(0.0, min(100.0, float(v))))
+        except (TypeError, ValueError):
+            pass
+    avg = round(sum(vals) / len(vals), 1) if vals else 0.0
+    cur = _SD_ORDER.get(str(req.current_difficulty).strip(), 2)
+    # 규칙: 세션 평균 70+ → 난이도 ↑, 50 미만 → ↓, 그 외 유지 (1~3 클램프)
+    nxt = cur + (1 if avg >= 70 else (-1 if avg < 50 else 0))
+    nxt = max(1, min(3, nxt))
+    stats = {"level": _lt_level_label(avg / 100.0, nxt),
+             "accuracy": round(avg / 100.0, 2),
+             "difficulty_reached": _LT_DIFF_KO[cur],
+             "by_topic": {}, "weak_topics": []}
+    # 약점 축 = 가장 낮은 점수 축
+    if scores:
+        weak_axis = min(scores.items(), key=lambda kv: kv[1])[0] if vals else None
+        stats["weak_axis"] = weak_axis
+    nr = not_ready(lang)
+    if nr:
+        rec, src = _lt_fallback_rec(stats), "fallback"
+    else:
+        rec, src = _lt_ai_recommend(profile, stats, lang)
+    return {"ok": True, "session_avg": avg,
+            "current_difficulty": _LT_DIFF_KO[cur], "next_difficulty": _LT_DIFF_KO[nxt],
+            "recommendation": rec, "recommendation_source": src}
