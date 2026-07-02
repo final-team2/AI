@@ -21,11 +21,11 @@ LLM_NAME  = "LGAI-EXAONE/EXAONE-Deep-7.8B"
 LLM_REV   = "e3f42b18f6b1"          # 절대 빼지 말 것 (main은 transformers v5 전제라 스택이 깨짐)
 EMB_MODEL = "BAAI/bge-m3"
 ADAPTER   = "/workspace/interview_ai/lora_adapter_v3"
-TRAIN     = "/workspace/interview_ai/train.jsonl"
+TRAIN     = "/workspace/interview_ai/train.rubric.jsonl"
 
 # ---- 추론 예산 강제 (폭주/524 방지) ----
 BUDGET_FORCE  = True    # 추론이 예산 넘으면 </thought> 강제 후 답변 생성 (False면 기존 동작)
-REASON_BUDGET = 1600    # 추론 단계 토큰 예산 (측정된 정상 최대 1156 위)
+REASON_BUDGET = 1000    # 추론 단계 토큰 예산 (측정된 정상 최대 1156 위)
 ANSWER_BUDGET = 768     # 강제 종료 후 답변(JSON/텍스트) 생성 예산
 
 
@@ -61,15 +61,21 @@ Score each of the four axes as an INTEGER from 0 to 100. This is a 0-100 scale, 
 - specificity: concreteness and depth
 - logic: logical structure
 - communication: clarity of delivery
+Also score the answer's STAR structure on a 1-5 scale per item (NOT 0-100). Score each item independently; do not average or sum.
+- situation: 5=concrete, complex context (when, which project), 3=present but generic, 1=no situation given
+- task: 5=own role/goal clear, 3=present but passive ("was asked to"), 1=unclear
+- action: 5=own concrete actions step by step ("I did"), 3=present but lots of "we" or abstract, 1=unclear or hypothetical ("I would")
+- result: 5=quantified outcome (numbers/effect), 3=present but qualitative, 1=no result
+STAR matters for behavioral/experience questions; for a pure technical/knowledge question it is natural for STAR to be weak, so assign a low score (1-2). Distribution: a typical or generic answer scores mostly 2-3 per item. Give 5 only when truly specific and exemplary, 4 only when clearly strong. Do NOT give high scores to all items; discriminate per item by the answer's actual level. This 1-5 scale is separate from the 0-100 axis scores.
 Bands: excellent 80-95 / good 60-75 / fair 40-55 / weak 15-35 / very weak 0-10.
 
-Think concisely in English. Do NOT write any JSON inside your thinking. After thinking, output ONLY one JSON object (all content in English), exactly in this shape:
-{"scores":{"technical_accuracy":85,"specificity":70,"logic":80,"communication":75},"strengths":["..."],"improvements":["..."],"feedback":"..."}
+Think concisely in English. Do NOT write any JSON inside your thinking. Apply the criteria carefully to decide each score, but once decided, do not repeat the same deliberation; output the JSON immediately. Do not repeat identical second-guessing ("but", "recalculating"). After thinking, output ONLY one JSON object (all content in English), exactly in this shape:
+{"scores":{"technical_accuracy":85,"specificity":70,"logic":80,"communication":75},"star":{"situation":4,"task":4,"action":5,"result":4},"strengths":["..."],"improvements":["..."],"feedback":"..."}
 
 Worked example (for format and scale calibration only):
 [Interview Question] Explain what an index is in a database.
 [Candidate Answer] An index is like a book's table of contents; it lets the database find rows without scanning the whole table, speeding up reads but slightly slowing writes.
-{"scores":{"technical_accuracy":82,"specificity":68,"logic":80,"communication":85},"strengths":["Clear analogy","Notes the read/write trade-off"],"improvements":["Could mention B-tree structure or which columns to index"],"feedback":"Accurate and well-communicated; add concrete detail on index internals to score higher."}"""
+{"scores":{"technical_accuracy":82,"specificity":68,"logic":80,"communication":85},"star":{"situation":1,"task":1,"action":1,"result":1},"strengths":["Clear analogy","Notes the read/write trade-off"],"improvements":["Could mention B-tree structure or which columns to index"],"feedback":"Accurate and well-communicated; add concrete detail on index internals to score higher."}"""
 
 # ---- 면접관 페르소나 (언어별) ----
 PERSONAS = {
@@ -133,6 +139,46 @@ def clamp_scores(scores):
             v = 0
         out[k] = max(0, min(100, v))
     return out
+
+_STAR_GRADE = {5: "A", 4: "B", 3: "C", 2: "D", 1: "F"}
+
+def _star_overall_grade(avg100):
+    o = avg100
+    if o >= 90: return "A+"
+    if o >= 83: return "A"
+    if o >= 80: return "A-"
+    if o >= 73: return "B+"
+    if o >= 67: return "B"
+    if o >= 60: return "B-"
+    if o >= 53: return "C+"
+    if o >= 47: return "C"
+    if o >= 40: return "C-"
+    if o >= 20: return "D"
+    return "F"
+
+def clamp_star(star):
+    """LLM이 낸 star(항목별 1~5) -> 개별 점수(x20)+등급(A~F) + 종합 평균+세분화 등급.
+    미평가(0)는 종합에서 제외. 프론트 e.star.S 호환. 반환: (score, grade, overall, overall_grade)."""
+    star = star or {}
+    keys = {"S": "situation", "T": "task", "A": "action", "R": "result"}
+    score, grade, valid = {}, {}, []
+    for short, full in keys.items():
+        try:
+            v = int(round(float(star.get(full, 0))))
+        except (TypeError, ValueError):
+            v = 0
+        if v <= 0:
+            score[short], grade[short] = 0, "N/A"
+        else:
+            v = max(1, min(5, v))
+            score[short], grade[short] = v * 20, _STAR_GRADE[v]
+            valid.append(v)
+    if valid:
+        overall = round(sum(valid) / len(valid) * 20)
+        og = _star_overall_grade(overall)
+    else:
+        overall, og = 0, "N/A"
+    return score, grade, overall, og
 
 def fix_overall(scores):
     vals = [int(scores.get(k, 0)) for k in SCORE_KEYS]
@@ -363,6 +409,15 @@ async def lifespan(app):
     M["index"]     = faiss.read_index(os.path.join(RAG_DIR, "ict_questions.index"))
     M["records"]   = json.load(open(os.path.join(RAG_DIR, "ict_questions.json"), encoding="utf-8"))
     print(f">>> RAG(ko) 로드 완료: 질문 {M['index'].ntotal}개", flush=True)
+    # --- FAQ RAG 인덱스 로딩 (챗봇용) — 있으면 로딩, 없으면 건너뜀(하위호환) ---
+    _faq_idx = os.path.join(RAG_DIR, "faq.index")
+    _faq_jsn = os.path.join(RAG_DIR, "faq.json")
+    if os.path.exists(_faq_idx) and os.path.exists(_faq_jsn):
+        M["faq_index"]   = faiss.read_index(_faq_idx)
+        M["faq_records"] = json.load(open(_faq_jsn, encoding="utf-8"))
+        print(f">>> FAQ RAG 로드 완료: {M['faq_index'].ntotal}개", flush=True)
+    else:
+        print(">>> (FAQ 인덱스 없음 — 챗봇은 면접RAG/폴백으로만 동작)", flush=True)
     en_idx  = os.path.join(RAG_DIR, "ict_questions_en.index")
     en_json = os.path.join(RAG_DIR, "ict_questions_en.json")
     if os.path.exists(en_idx) and os.path.exists(en_json):
@@ -427,6 +482,10 @@ def embed_query(text, max_len=256):
     return v.float().cpu().numpy().astype("float32")
 
 # ---------------- 요청 스키마 ----------------
+class ChatReq(BaseModel):
+    message: str
+    lang: str = "ko"
+
 class QuestionReq(BaseModel):
     topic: str
     k: int = 3
@@ -526,12 +585,17 @@ def evaluate(req: EvaluateReq):
     if err: return {"ok": False, "error": err}
     prompt = eval_prompt(lang, req.question, req.answer)
     use_adapter = (lang == "ko")     # 한국어=형식 학습된 어댑터 / 영어=base + 강화 rubric
-    gen = run_llm(prompt, PREFILL[lang], use_adapter=use_adapter, max_new_tokens=4096)
+    gen = run_llm(prompt, PREFILL[lang], use_adapter=use_adapter, max_new_tokens=2048)
     ev = parse_json_lenient(gen)
     if ev and isinstance(ev.get("scores"), dict):
         ev["scores"] = clamp_scores(ev["scores"])
         ev["overall"] = fix_overall(ev["scores"])
         ev["display_scores"] = to_question_scores(ev["scores"])
+        _ss, _sg, _so, _sog = clamp_star(ev.get("star"))
+        ev["star"] = _ss
+        ev["star_grade"] = _sg
+        ev["star_overall"] = _so
+        ev["star_overall_grade"] = _sog
         return {"ok": True, "evaluation": ev}
     return {"ok": False, "error": MSG[lang]["eval_fail"], "raw": gen[-1500:]}
 
@@ -549,10 +613,10 @@ def _eval_stream_gen(prompt, prefill, use_adapter, lang):
         try:
             with torch.no_grad():
                 if use_adapter:
-                    holder["out"] = M["llm"].generate(**enc, max_new_tokens=4096, do_sample=False, streamer=streamer)
+                    holder["out"] = M["llm"].generate(**enc, max_new_tokens=2048, do_sample=False, streamer=streamer)
                 else:
                     with M["llm"].disable_adapter():
-                        holder["out"] = M["llm"].generate(**enc, max_new_tokens=4096, do_sample=False, streamer=streamer)
+                        holder["out"] = M["llm"].generate(**enc, max_new_tokens=2048, do_sample=False, streamer=streamer)
         except Exception as e:
             holder["err"] = e
     GEN_LOCK.acquire()                      # 비스트리밍과 같은 락으로 직렬화
@@ -577,12 +641,17 @@ def _eval_stream_gen(prompt, prefill, use_adapter, lang):
         out = holder.get("out")
         if out is not None:
             gl = int(out.shape[1] - plen); dt = time.time() - t0
-            print(f">>> [gen-stream] {gl}tok / {dt:.1f}s = {gl/max(dt,1e-9):.1f} tok/s (cap 4096, adapter={use_adapter})", flush=True)
+            print(f">>> [gen-stream] {gl}tok / {dt:.1f}s = {gl/max(dt,1e-9):.1f} tok/s (cap 2048, adapter={use_adapter})", flush=True)
         ev = parse_json_lenient(gen_text)
         if ev and isinstance(ev.get("scores"), dict):
             ev["scores"] = clamp_scores(ev["scores"])
             ev["overall"] = fix_overall(ev["scores"])
             ev["display_scores"] = to_question_scores(ev["scores"])
+            _ss, _sg, _so, _sog = clamp_star(ev.get("star"))
+            ev["star"] = _ss
+            ev["star_grade"] = _sg
+            ev["star_overall"] = _so
+            ev["star_overall_grade"] = _sog
             payload = {"type": "done", "ok": True, "evaluation": ev}
         else:
             payload = {"type": "done", "ok": False, "error": MSG[lang]["eval_fail"]}
@@ -1877,3 +1946,375 @@ def education_lesson_stream(req: LessonReq):
     prompt = lesson_prompt(lang, req.topic, req.difficulty, related)
     return StreamingResponse(_lesson_stream_gen(prompt, LESSON_PREFILL[lang], lang, related),
                              media_type="text/event-stream", headers=sse_headers)
+
+
+# ============================================================
+#  챗봇 /chat — 하이브리드 RAG (FAQ 강매칭=캔드 / 부분매칭=LLM근거생성 / 폴백)
+# ============================================================
+FAQ_STRONG     = 0.80   # 이 이상: 캔드 답 그대로 (빠름·정확)
+FAQ_WEAK       = 0.55   # 이 이상~STRONG 미만: top-3 FAQ 근거로 LLM 생성
+INTERVIEW_HINT = 0.60   # FAQ 약하고 면접질문 이 이상이면 면접 유도
+
+CHAT_LLM_PREFILL = {
+    "ko": "먼저 아래 제공된 FAQ 내용만 근거로, 사용자의 질문에 정확히 답할 수 있는지 살펴보겠습니다. ",
+    "en": "First, let me check whether the provided FAQ entries can accurately answer the user's question. ",
+}
+
+def _chat_llm_prompt(lang, msg, faqs):
+    ctx = "\n".join(f"- (Q: {f.get('question','')}) {f.get('answer','')}" for f in faqs)
+    if lang == "en":
+        return (
+            "You are DevReady's customer-support chatbot. Answer the user's question "
+            "using ONLY the FAQ entries below. Do NOT invent service details (pricing, "
+            "policies, features) that are not stated. If the FAQs don't cover it, say you "
+            "can't answer precisely and suggest asking about DevReady usage.\n"
+            "Answer in 2-4 natural sentences, conversational, no markdown.\n\n"
+            f"[FAQ]\n{ctx}\n\n[User question]\n{msg}"
+        )
+    return (
+        "당신은 DevReady 고객지원 챗봇입니다. 아래 FAQ 내용에서만 근거를 찾아 사용자의 질문에 "
+        "답하세요. FAQ에 없는 서비스 정보(요금·정책·기능)를 지어내지 마세요. FAQ로 답할 수 없으면 "
+        "정확히 답하기 어렵다고 밝히고 DevReady 이용 방법을 물어봐 달라고 안내하세요.\n"
+        "2~4문장으로 자연스러운 대화체, 마크다운 없이 답하세요.\n\n"
+        f"[FAQ]\n{ctx}\n\n[사용자 질문]\n{msg}"
+    )
+
+@app.post("/chat")
+def chat(req: ChatReq):
+    lang = norm_lang(req.lang)
+    nr = not_ready(lang)
+    if nr:
+        return nr
+    msg = (req.message or "").strip()
+    if not msg:
+        return {"ok": False, "error": "메시지가 비어 있습니다. / Empty message."}
+    if len(msg) > 1000:
+        msg = msg[:1000]
+    qv = embed_query(msg)
+
+    # ① FAQ 검색 (top-3 — 근거 후보 확보)
+    faq_hits = []
+    if "faq_index" in M and M["faq_index"].ntotal > 0:
+        k = min(3, M["faq_index"].ntotal)
+        s, i = M["faq_index"].search(qv, k)
+        for rank in range(k):
+            faq_hits.append((float(s[0][rank]), int(i[0][rank])))
+    top_score = faq_hits[0][0] if faq_hits else 0.0
+
+    # ② 강매칭(>=0.80) → 캔드 답 그대로 (빠름)
+    if faq_hits and top_score >= FAQ_STRONG:
+        rec = M["faq_records"][faq_hits[0][1]]
+        return {
+            "ok": True, "source": "faq", "score": round(top_score, 4),
+            "category": rec.get("category", ""),
+            "answer": rec["answer"],
+            "matched_question": rec["question"],
+        }
+
+    # ②' 부분매칭(0.55~0.80) → top-3 FAQ 근거로 LLM 생성
+    if faq_hits and top_score >= FAQ_WEAK:
+        ctx_recs = [M["faq_records"][idx] for _, idx in faq_hits]
+        prompt = _chat_llm_prompt(lang, msg, ctx_recs)
+        try:
+            gen = run_llm(prompt, CHAT_LLM_PREFILL[lang], use_adapter=False,
+                          max_new_tokens=1536, do_sample=False)
+            answer = _strip_thought(gen).strip() if "</thought>" in gen else ""
+        except Exception as e:
+            print(f">>> [chat] LLM 생성 실패: {e}", flush=True)
+            answer = ""
+        if answer:
+            top_rec = ctx_recs[0]
+            return {
+                "ok": True, "source": "faq_llm", "score": round(top_score, 4),
+                "category": top_rec.get("category", ""),
+                "answer": answer,
+                "matched_question": top_rec.get("question", ""),
+            }
+        top_rec = ctx_recs[0]
+        return {
+            "ok": True, "source": "faq", "score": round(top_score, 4),
+            "category": top_rec.get("category", ""),
+            "answer": top_rec["answer"],
+            "matched_question": top_rec.get("question", ""),
+        }
+
+    # ③ FAQ 약함 → 면접질문 RAG 확인 (기술 질문이면 면접 유도)
+    iv_best = None
+    if "index" in M and M["index"].ntotal > 0:
+        s, i = M["index"].search(qv, 1)
+        iv_best = (float(s[0][0]), int(i[0][0]))
+    if iv_best and iv_best[0] >= INTERVIEW_HINT:
+        rel = ""
+        try:
+            rel = M["records"][iv_best[1]].get("question", "")
+        except Exception:
+            rel = ""
+        return {
+            "ok": True, "source": "interview", "score": round(iv_best[0], 4),
+            "answer": ("기술 면접 질문에 가까운 내용이네요. 모의 면접에서 직접 연습하면서 "
+                       "AI 채점과 피드백을 받아보시는 걸 추천드려요. 면접 페이지에서 시작할 수 있습니다."),
+            "related_question": rel,
+        }
+
+    # ④ 둘 다 실패 → 폴백
+    return {
+        "ok": True, "source": "none",
+        "answer": ("죄송해요, 그 질문은 제가 정확히 답하기 어려워요. "
+                   "DevReady 서비스 이용 방법(회원가입, 이력서, 모의 면접, 학습, 결제 등)에 대해 "
+                   "물어봐 주시면 안내해 드릴게요."),
+    }
+
+
+# ============================================================
+#  챗봇 /chat/stream — SSE 스트리밍 (부분매칭 LLM만 실시간 타이핑)
+# ============================================================
+def _chat_tee(it, sink):
+    for c in it:
+        sink.append(c)
+        yield c
+
+_CHAT_SPECIAL = re.compile(r"\[\|[^|]*\|\]|<\|[^|]*\|>")
+
+def _chat_clean(p):
+    return _CHAT_SPECIAL.sub("", p)
+
+def _chat_body_pieces(it):
+    # </thought> 이전(사고)은 버퍼링, 이후(실답변)만 흘림 + 특수토큰([|...|]/<|...|>) 제거 + 빈조각 skip
+    seen = False
+    buf = ""
+    for c in it:
+        if seen:
+            c2 = _chat_clean(c)
+            if c2:
+                yield c2
+            continue
+        buf += c
+        idx = buf.find("</thought>")
+        if idx != -1:
+            after = _chat_clean(buf[idx + len("</thought>"):])
+            seen = True
+            if after:
+                yield after
+
+def _chat_stream_gen(msg, faqs, lang, score, top_rec):
+    from transformers import TextIteratorStreamer
+    prompt = _chat_llm_prompt(lang, msg, faqs)
+    prefill = CHAT_LLM_PREFILL[lang]
+    msgs = [{"role": "user", "content": prompt}]
+    text = M["llm_tok"].apply_chat_template(msgs, tokenize=False, add_generation_prompt=True) + prefill
+    enc = M["llm_tok"](text, return_tensors="pt", add_special_tokens=False).to(M["llm"].device)
+    plen = enc["input_ids"].shape[1]
+    streamer = TextIteratorStreamer(M["llm_tok"], skip_prompt=True, skip_special_tokens=False)
+    holder = {}
+    def _gen():
+        try:
+            with torch.no_grad():
+                with M["llm"].disable_adapter():     # 챗봇 답변은 base 모델
+                    holder["out"] = M["llm"].generate(**enc, max_new_tokens=1536,
+                                                       do_sample=False, streamer=streamer)
+        except Exception as e:
+            holder["err"] = e
+    GEN_LOCK.acquire()
+    t = threading.Thread(target=_gen, daemon=True)
+    t0 = time.time()
+    t.start()
+    full = []
+    try:
+        for piece in _chat_body_pieces(_chat_tee(streamer, full)):
+            yield "data: " + json.dumps({"type": "token", "text": piece}, ensure_ascii=False) + "\n\n"
+        t.join()
+        if "err" in holder:
+            raise holder["err"]
+        _raw = "".join(full)
+        answer = _strip_thought(_raw).strip() if "</thought>" in _raw else ""
+        out = holder.get("out")
+        if out is not None:
+            gl = int(out.shape[1] - plen); dt = time.time() - t0
+            print(f">>> [chat-stream] {gl}tok / {dt:.1f}s = {gl/max(dt,1e-9):.1f} tok/s", flush=True)
+        if answer:
+            src = "faq_llm"
+        else:
+            answer = top_rec["answer"]   # 생성 실패 → 최상위 FAQ 캔드 폴백
+            src = "faq"
+        yield "data: " + json.dumps({"type": "done", "ok": True, "source": src,
+                                     "score": round(score, 4),
+                                     "category": top_rec.get("category", ""),
+                                     "answer": answer,
+                                     "matched_question": top_rec.get("question", "")},
+                                    ensure_ascii=False) + "\n\n"
+    except Exception as e:
+        yield "data: " + json.dumps({"type": "error", "error": f"{type(e).__name__}: {e}"},
+                                    ensure_ascii=False) + "\n\n"
+    finally:
+        if t.is_alive():
+            t.join()
+        try:
+            GEN_LOCK.release()
+        except RuntimeError:
+            pass
+
+@app.post("/chat/stream")
+def chat_stream(req: ChatReq):
+    lang = norm_lang(req.lang)
+    sse_headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+    def _one(obj):
+        def _g():
+            yield "data: " + json.dumps(obj, ensure_ascii=False) + "\n\n"
+        return _g()
+    nr = not_ready(lang)
+    if nr:
+        return StreamingResponse(_one({"type": "error", "error": nr["error"]}),
+                                 media_type="text/event-stream", headers=sse_headers)
+    msg = (req.message or "").strip()
+    if not msg:
+        return StreamingResponse(_one({"type": "error", "error": "메시지가 비어 있습니다. / Empty message."}),
+                                 media_type="text/event-stream", headers=sse_headers)
+    if len(msg) > 1000:
+        msg = msg[:1000]
+    qv = embed_query(msg)
+
+    # ① FAQ 검색 (top-3)
+    faq_hits = []
+    if "faq_index" in M and M["faq_index"].ntotal > 0:
+        k = min(3, M["faq_index"].ntotal)
+        s, i = M["faq_index"].search(qv, k)
+        for rank in range(k):
+            faq_hits.append((float(s[0][rank]), int(i[0][rank])))
+    top_score = faq_hits[0][0] if faq_hits else 0.0
+
+    # ② 강매칭(>=0.80) → done 즉시 (캔드, 생성 없음)
+    if faq_hits and top_score >= FAQ_STRONG:
+        rec = M["faq_records"][faq_hits[0][1]]
+        return StreamingResponse(_one({"type": "done", "ok": True, "source": "faq",
+                                       "score": round(top_score, 4),
+                                       "category": rec.get("category", ""),
+                                       "answer": rec["answer"],
+                                       "matched_question": rec["question"]}),
+                                 media_type="text/event-stream", headers=sse_headers)
+
+    # ②' 부분매칭(0.55~0.80) → LLM 스트리밍 (token → done)
+    if faq_hits and top_score >= FAQ_WEAK:
+        ctx_recs = [M["faq_records"][idx] for _, idx in faq_hits]
+        return StreamingResponse(_chat_stream_gen(msg, ctx_recs, lang, top_score, ctx_recs[0]),
+                                 media_type="text/event-stream", headers=sse_headers)
+
+    # ③ 면접유도 → done 즉시
+    iv_best = None
+    if "index" in M and M["index"].ntotal > 0:
+        s, i = M["index"].search(qv, 1)
+        iv_best = (float(s[0][0]), int(i[0][0]))
+    if iv_best and iv_best[0] >= INTERVIEW_HINT:
+        rel = ""
+        try:
+            rel = M["records"][iv_best[1]].get("question", "")
+        except Exception:
+            rel = ""
+        return StreamingResponse(_one({"type": "done", "ok": True, "source": "interview",
+                                       "score": round(iv_best[0], 4),
+                                       "answer": ("기술 면접 질문에 가까운 내용이네요. 모의 면접에서 직접 연습하면서 "
+                                                  "AI 채점과 피드백을 받아보시는 걸 추천드려요. 면접 페이지에서 시작할 수 있습니다."),
+                                       "related_question": rel}),
+                                 media_type="text/event-stream", headers=sse_headers)
+
+    # ④ 폴백 → done 즉시
+    return StreamingResponse(_one({"type": "done", "ok": True, "source": "none",
+                                   "answer": ("죄송해요, 그 질문은 제가 정확히 답하기 어려워요. "
+                                              "DevReady 서비스 이용 방법(회원가입, 이력서, 모의 면접, 학습, 결제 등)에 대해 "
+                                              "물어봐 주시면 안내해 드릴게요.")}),
+                             media_type="text/event-stream", headers=sse_headers)
+
+
+
+
+# ===== /recommend/explain =====
+EXPLAIN_PREFILL = {
+    "ko": "먼저 각 대상이 사용자 프로필과 어떻게 맞닿아 있는지 살펴보겠습니다. ",
+    "en": "First, let me review how each item matches the user profile. ",
+}
+
+class ExplainItem(BaseModel):
+    target_id: int
+    title: str
+    category: str = ""
+    difficulty: str = ""
+    matched: list = []
+
+class ExplainReq(BaseModel):
+    target_type: str = "COURSE"
+    profile: dict = {}
+    items: list = []
+    lang: str = "ko"
+
+@app.post("/recommend/explain")
+def recommend_explain(req: ExplainReq):
+    lang = norm_lang(req.lang)
+    nr = not_ready(lang)
+    if nr:
+        return nr
+    if not req.items:
+        return {"ok": False, "error": "items is empty"}
+
+    target_type = (req.target_type or "COURSE").upper()
+    profile = req.profile or {}
+    job_category = profile.get("job_category", "")
+    level = profile.get("level", "")
+    skills = profile.get("skills", [])
+    skills_str = ", ".join(skills) if skills else "-"
+
+    # 아이템 목록 직렬화 (프롬프트용)
+    lines = []
+    for it in req.items:
+        if isinstance(it, dict):
+            tid = it.get("target_id", "")
+            title = it.get("title", "")
+            cat = it.get("category", "")
+            diff = it.get("difficulty", "")
+            matched = it.get("matched", [])
+        else:
+            tid = getattr(it, "target_id", "")
+            title = getattr(it, "title", "")
+            cat = getattr(it, "category", "")
+            diff = getattr(it, "difficulty", "")
+            matched = getattr(it, "matched", [])
+        matched_str = ", ".join(matched) if matched else "-"
+        lines.append(f"- id:{tid} | {title} | 직군:{cat} | 난이도:{diff} | 매칭근거:{matched_str}")
+    items_block = "\n".join(lines)
+
+    if lang == "en":
+        prompt = f"""You are a career advisor. For each item below, write a 1-2 sentence explanation of why it suits this user. Base your explanation strictly on the matched signals provided — do not invent content.
+
+User profile: job_category={job_category}, level={level}, skills=[{skills_str}]
+Target type: {target_type}
+
+Items:
+{items_block}
+
+Rules:
+- One entry per item, keyed by id
+- 1-2 sentences each, natural English
+- Ground strictly in matched signals
+- After your thinking, output ONLY this JSON:
+  {{"reasons": [{{"target_id": <id>, "reason": "<1-2 sentences>"}}]}}"""
+    else:
+        prompt = f"""당신은 커리어 어드바이저입니다. 아래 각 항목이 이 사용자에게 왜 맞는지 1~2문장으로 설명하세요. 반드시 제공된 매칭 근거에만 기반하고, 없는 내용을 지어내지 마세요.
+
+사용자 프로필: 직군={job_category}, 레벨={level}, 보유스킬=[{skills_str}]
+추천 대상 유형: {target_type}
+
+대상 목록:
+{items_block}
+
+규칙:
+- 항목마다 target_id로 키잉
+- 각 1~2문장, 자연스러운 한국어
+- 매칭 근거에만 근거할 것
+- 사고 과정을 마친 뒤, 마지막에 JSON만 출력:
+  {{"reasons": [{{"target_id": <id>, "reason": "<1~2문장>"}}]}}"""
+
+    gen = run_llm(prompt, EXPLAIN_PREFILL[lang], use_adapter=False,
+                  max_new_tokens=2048, do_sample=True)
+    d = parse_json_lenient(gen)
+    if d and "reasons" in d and isinstance(d["reasons"], list):
+        return {"ok": True, "target_type": target_type, "reasons": d["reasons"]}
+    return {"ok": False, "target_type": target_type, "reasons": [],
+            "error": "parse_failed", "raw": gen[-1500:]}
