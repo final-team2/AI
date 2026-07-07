@@ -2318,3 +2318,81 @@ Rules:
         return {"ok": True, "target_type": target_type, "reasons": d["reasons"]}
     return {"ok": False, "target_type": target_type, "reasons": [],
             "error": "parse_failed", "raw": gen[-1500:]}
+
+
+# ===== Quiz SSE streaming - /education/quiz/stream (mirrors evaluate/stream) =====
+def _quiz_stream_gen(prompt, prefill, lang, n, topic):
+    from transformers import TextIteratorStreamer
+    msgs = [{"role": "user", "content": prompt}]
+    text = M["llm_tok"].apply_chat_template(msgs, tokenize=False, add_generation_prompt=True) + prefill
+    enc = M["llm_tok"](text, return_tensors="pt", add_special_tokens=False).to(M["llm"].device)
+    plen = enc["input_ids"].shape[1]
+    streamer = TextIteratorStreamer(M["llm_tok"], skip_prompt=True, skip_special_tokens=False)
+    holder = {}
+    def _gen():
+        try:
+            with torch.no_grad():
+                with M["llm"].disable_adapter():  # quiz always uses base model
+                    holder["out"] = M["llm"].generate(
+                        **enc, max_new_tokens=3072, do_sample=True,
+                        temperature=0.8, top_p=0.9, streamer=streamer)
+        except Exception as e:
+            holder["err"] = e
+    GEN_LOCK.acquire()  # same lock as non-stream, serialize GPU
+    t = threading.Thread(target=_gen, daemon=True)
+    t0 = time.time()
+    t.start()
+    full = []
+    try:
+        for chunk in streamer:
+            if not chunk:
+                continue
+            full.append(chunk)
+            piece = chunk
+            for _tok in ("[|endofturn|]", "[|assistant|]", "[|system|]", "[|user|]", "[|endoftext|]"):
+                piece = piece.replace(_tok, "")
+            if piece:
+                yield "data: " + json.dumps({"type": "token", "text": piece}, ensure_ascii=False) + "\n\n"
+        t.join()
+        if "err" in holder:
+            raise holder["err"]
+        gen_text = "".join(full)
+        out = holder.get("out")
+        if out is not None:
+            gl = int(out.shape[1] - plen); dt = time.time() - t0
+            print(f">>> [quiz-stream] {gl}tok / {dt:.1f}s = {gl/max(dt,1e-9):.1f} tok/s (cap 3072, adapter=False)", flush=True)
+        parsed = parse_json_lenient(gen_text)
+        items = _build_quiz_items(parsed, n)
+        if items:
+            payload = {"type": "done", "ok": True, "topic": topic, "count": len(items), "quiz": items}
+        else:
+            payload = {"type": "done", "ok": False, "error": MSG[lang]["gen_fail"], "raw": gen_text[-1500:]}
+        yield "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
+    except Exception as e:
+        yield "data: " + json.dumps({"type": "error", "error": f"{type(e).__name__}: {e}"}, ensure_ascii=False) + "\n\n"
+    finally:
+        if t.is_alive():
+            t.join()  # wait for generate to finish before releasing lock
+        try:
+            GEN_LOCK.release()
+        except RuntimeError:
+            pass
+
+
+@app.post("/education/quiz/stream")
+def education_quiz_stream(req: QuizReq):
+    lang = norm_lang(req.lang)
+    sse_headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+    def _one(obj):
+        def _g():
+            yield "data: " + json.dumps(obj, ensure_ascii=False) + "\n\n"
+        return _g()
+    nr = not_ready(lang)
+    if nr:
+        return StreamingResponse(_one({"type": "error", "error": nr["error"]}), media_type="text/event-stream", headers=sse_headers)
+    err = vlen("topic", req.topic, lang)
+    if err:
+        return StreamingResponse(_one({"type": "error", "error": err}), media_type="text/event-stream", headers=sse_headers)
+    n = max(1, min(10, req.n))
+    prompt = quiz_prompt(lang, req.topic, n, req.difficulty)
+    return StreamingResponse(_quiz_stream_gen(prompt, QUIZ_PREFILL[lang], lang, n, req.topic), media_type="text/event-stream", headers=sse_headers)
