@@ -225,7 +225,7 @@ import threading
 GEN_LOCK = threading.Lock()   # GPU 생성 직렬화: 동시 요청이 같은 모델에 동시에 generate -> CUDA 충돌/오염 방지
 
 def run_llm(prompt, prefill, use_adapter=True, max_new_tokens=2048,
-            do_sample=False, temperature=0.8, top_p=0.9):
+            do_sample=False, temperature=0.8, top_p=0.9, reason_budget=None):
     msgs = [{"role": "user", "content": prompt}]
     text = M["llm_tok"].apply_chat_template(msgs, tokenize=False, add_generation_prompt=True) + prefill
     enc = M["llm_tok"](text, return_tensors="pt", add_special_tokens=False).to(M["llm"].device)
@@ -249,7 +249,8 @@ def run_llm(prompt, prefill, use_adapter=True, max_new_tokens=2048,
             if not BUDGET_FORCE:
                 o = _gen(enc["input_ids"], enc["attention_mask"], max_new_tokens)
             else:
-                rb = min(REASON_BUDGET, max_new_tokens)
+                _rb_src = reason_budget if reason_budget is not None else REASON_BUDGET
+                rb = min(_rb_src, max_new_tokens)
                 o1 = _gen(enc["input_ids"], enc["attention_mask"], rb)
                 n1 = int(o1.shape[1] - plen)
                 if n1 < rb:
@@ -584,7 +585,9 @@ def evaluate(req: EvaluateReq):
     err = vlen("question", req.question, lang) or vlen("answer", req.answer, lang)
     if err: return {"ok": False, "error": err}
     prompt = eval_prompt(lang, req.question, req.answer)
-    use_adapter = (lang == "ko")     # 한국어=형식 학습된 어댑터 / 영어=base + 강화 rubric
+    # [어댑터 미사용] QLoRA 어댑터가 5축을 0~100 대신 1~5로 왜곡 + tok/s 8.2로 저하 →
+    # base 모델(EXAONE)로 채점(척도 정상 0~100 + ~50 tok/s). 어댑터 원인규명·재학습은 발표 후 과제(DEVLOG 참조).
+    use_adapter = False
     gen = run_llm(prompt, PREFILL[lang], use_adapter=use_adapter, max_new_tokens=2048)
     ev = parse_json_lenient(gen)
     if ev and isinstance(ev.get("scores"), dict):
@@ -681,7 +684,7 @@ def evaluate_stream(req: EvaluateReq):
     if err:
         return StreamingResponse(_one({"type": "error", "error": err}), media_type="text/event-stream", headers=sse_headers)
     prompt = eval_prompt(lang, req.question, req.answer)
-    use_adapter = (lang == "ko")
+    use_adapter = False  # [어댑터 미사용] 위 evaluate와 동일 이유(척도 왜곡+속도) — base 사용
     return StreamingResponse(_eval_stream_gen(prompt, PREFILL[lang], use_adapter, lang), media_type="text/event-stream", headers=sse_headers)
 
 @app.post("/interview/generate")
@@ -694,7 +697,7 @@ def generate_questions(req: GenerateReq):
     n = max(1, min(15, req.n))
     intro = PERSONAS[lang].get(req.persona, PERSONAS[lang]["default"])
     prompt = gen_prompt(lang, intro, n, req.resume, req.job_posting)
-    gen = run_llm(prompt, GEN_PREFILL[lang], use_adapter=False, max_new_tokens=2048, do_sample=True)
+    gen = run_llm(prompt, GEN_PREFILL[lang], use_adapter=False, max_new_tokens=2048, do_sample=True, reason_budget=350)
     d = parse_json_lenient(gen)
     if d and isinstance(d.get("questions"), list):
         return {"ok": True, "questions": d["questions"]}
@@ -709,7 +712,7 @@ def followup(req: FollowupReq):
     if err: return {"ok": False, "error": err}
     intro = PERSONAS[lang].get(req.persona, PERSONAS[lang]["default"])
     prompt = fu_prompt(lang, intro, req.question, req.answer, req.history)
-    gen = run_llm(prompt, FU_PREFILL[lang], use_adapter=False, max_new_tokens=1536, do_sample=True)
+    gen = run_llm(prompt, FU_PREFILL[lang], use_adapter=False, max_new_tokens=1536, do_sample=True, reason_budget=350)
     d = parse_json_lenient(gen)
     if d and "followup" in d:
         return {"ok": True, "followup": d.get("followup", "")}
