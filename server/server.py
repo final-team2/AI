@@ -25,7 +25,7 @@ TRAIN     = "/workspace/interview_ai/train.rubric.jsonl"
 
 # ---- 추론 예산 강제 (폭주/524 방지) ----
 BUDGET_FORCE  = True    # 추론이 예산 넘으면 </thought> 강제 후 답변 생성 (False면 기존 동작)
-REASON_BUDGET = 1000    # 추론 단계 토큰 예산 (측정된 정상 최대 1156 위)
+REASON_BUDGET = 500    # 추론 단계 토큰 예산 (측정된 정상 최대 1156 위)
 ANSWER_BUDGET = 768     # 강제 종료 후 답변(JSON/텍스트) 생성 예산
 
 
