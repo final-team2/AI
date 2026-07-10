@@ -56,10 +56,11 @@ RUBRIC_EN = """You are a web-developer hiring interviewer. Evaluate the [Candida
 
 First decide whether this is a 'technical question' or a 'behavioral / experience / motivation question' (collaboration, conflict, motivation, team fit, strengths/weaknesses). For behavioral questions do NOT demand technical knowledge or say "a code/technical approach is needed"; assess whether the attitude, experience, and reasoning are sound and convincing.
 
-Score each of the four axes as an INTEGER from 0 to 100. This is a 0-100 scale, NOT a 0-10 scale. A strong answer is about 85 (NOT 8); an average answer is about 55 (NOT 5); a weak answer is about 25. Be discriminating: vague or hedging answers ("I'm not sure, maybe...") should score low on specificity and technical_accuracy.
+Score each of the five axes as an INTEGER from 0 to 100. This is a 0-100 scale, NOT a 0-10 scale. A strong answer is about 85 (NOT 8); an average answer is about 55 (NOT 5); a weak answer is about 25. Be discriminating: vague or hedging answers ("I'm not sure, maybe...") should score low on specificity and technical_accuracy.
 - technical_accuracy: correctness and validity of the content
 - specificity: concreteness and depth
 - logic: logical structure
+- depth: understanding of underlying principles, root causes, and deeper reasoning (the "why" behind the answer)
 - communication: clarity of delivery
 Also score the answer's STAR structure on a 1-5 scale per item (NOT 0-100). Score each item independently; do not average or sum.
 - situation: 5=concrete, complex context (when, which project), 3=present but generic, 1=no situation given
@@ -70,12 +71,12 @@ STAR matters for behavioral/experience questions; for a pure technical/knowledge
 Bands: excellent 80-95 / good 60-75 / fair 40-55 / weak 15-35 / very weak 0-10.
 
 Think concisely in English. Do NOT write any JSON inside your thinking. Apply the criteria carefully to decide each score, but once decided, do not repeat the same deliberation; output the JSON immediately. Do not repeat identical second-guessing ("but", "recalculating"). After thinking, output ONLY one JSON object (all content in English), exactly in this shape:
-{"scores":{"technical_accuracy":85,"specificity":70,"logic":80,"communication":75},"star":{"situation":4,"task":4,"action":5,"result":4},"strengths":["..."],"improvements":["..."],"feedback":"..."}
+{"scores":{"technical_accuracy":85,"specificity":70,"logic":80,"depth":78,"communication":75},"star":{"situation":4,"task":4,"action":5,"result":4},"strengths":["..."],"improvements":["..."],"feedback":"..."}
 
 Worked example (for format and scale calibration only):
 [Interview Question] Explain what an index is in a database.
 [Candidate Answer] An index is like a book's table of contents; it lets the database find rows without scanning the whole table, speeding up reads but slightly slowing writes.
-{"scores":{"technical_accuracy":82,"specificity":68,"logic":80,"communication":85},"star":{"situation":1,"task":1,"action":1,"result":1},"strengths":["Clear analogy","Notes the read/write trade-off"],"improvements":["Could mention B-tree structure or which columns to index"],"feedback":"Accurate and well-communicated; add concrete detail on index internals to score higher."}"""
+{"scores":{"technical_accuracy":82,"specificity":68,"logic":80,"depth":75,"communication":85},"star":{"situation":1,"task":1,"action":1,"result":1},"strengths":["Clear analogy","Notes the read/write trade-off"],"improvements":["Could mention B-tree structure or which columns to index"],"feedback":"Accurate and well-communicated; add concrete detail on index internals to score higher."}"""
 
 # ---- 면접관 페르소나 (언어별) ----
 PERSONAS = {
@@ -95,10 +96,10 @@ PERSONAS = {
     },
 }
 
-SCORE_KEYS = ["technical_accuracy", "specificity", "logic", "communication"]
+SCORE_KEYS = ["technical_accuracy", "specificity", "logic", "depth", "communication"]
 LABEL = {
-    "ko": {"technical_accuracy": "기술 정확도", "specificity": "답변 구체성", "logic": "논리성", "communication": "의사소통"},
-    "en": {"technical_accuracy": "Technical accuracy", "specificity": "Specificity", "logic": "Logic", "communication": "Communication"},
+    "ko": {"technical_accuracy": "기술 정확도", "specificity": "답변 구체성", "logic": "논리성", "depth": "심화이해", "communication": "의사소통"},
+    "en": {"technical_accuracy": "Technical accuracy", "specificity": "Specificity", "logic": "Logic", "depth": "Depth", "communication": "Communication"},
 }
 LIMITS = {"question": 2000, "answer": 6000, "topic": 500,
           "resume": 12000, "job_posting": 12000}
