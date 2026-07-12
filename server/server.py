@@ -2420,3 +2420,106 @@ def education_quiz_stream(req: QuizReq):
     n = max(1, min(10, req.n))
     prompt = quiz_prompt(lang, req.topic, n, req.difficulty)
     return StreamingResponse(_quiz_stream_gen(prompt, QUIZ_PREFILL[lang], lang, n, req.topic), media_type="text/event-stream", headers=sse_headers)
+
+
+# ── 신고 AI 1차 판정(A-017) — POST /report/judge (비동기 호출, 120s) ──────────
+REPORT_JUDGE_PREFILL = {
+    "ko": "먼저 신고 대상 콘텐츠를 커뮤니티 규칙에 비추어 살펴보고, 위반 가능성을 상/중/하로 판단한 뒤 근거를 정리하겠습니다. ",
+    "en": "First, I will assess the reported content against community rules and decide the violation likelihood. ",
+}
+GRADE_NORMALIZE = {  # LLM이 등급을 다른 말로 낼 때 흡수(최종은 {상,중,하}로만)
+    "상": "상", "중": "중", "하": "하",
+    "높음": "상", "중간": "중", "낮음": "하",
+    "high": "상", "medium": "중", "low": "하",
+}
+
+class ReportJudgeReq(BaseModel):
+    targetType: str = None
+    content: str = None
+    lang: str = "ko"
+
+@app.post("/report/judge")
+def report_judge(req: ReportJudgeReq):
+    lang = norm_lang(req.lang)
+    nr = not_ready(lang)
+    if nr:                                  # 미로딩 → ok:false → 소비자 NULL(미판정) 저장
+        return nr
+    content = (req.content or "").strip()
+    if not content:
+        return {"ok": False, "error": MSG[lang]["gen_fail"]}
+    snippet = content[:2000]                # 긴 글은 잘라 넣되 거부하지 않음(생성시간 상한)
+    ttype = "댓글" if str(req.targetType).upper() == "COMMENT" else "게시글"
+    prompt = (
+        f"당신은 커뮤니티 신고 검토 보조 AI입니다. 아래 {ttype} 내용이 커뮤니티 규칙을 "
+        f"위반할 가능성을 판정하세요.\n"
+        f"위반 예: 욕설/모욕, 스팸/광고, 음란물, 개인정보 노출, 혐오/차별.\n\n"
+        f"[{ttype} 내용]\n{snippet}\n\n"
+        f"위반 가능성을 '상'(높음)/'중'(중간)/'하'(낮음) 중 하나로 정하고, 한국어로 한 문장 "
+        f"사유를 쓰세요. JSON만 출력하세요.\n형식: {{\"judgment\": \"상\", \"reason\": \"...\"}}"
+    )
+    try:
+        gen = run_llm(prompt, REPORT_JUDGE_PREFILL[lang], use_adapter=False,
+                      max_new_tokens=512, reason_budget=400)
+        data = parse_json_lenient(gen)
+        if not isinstance(data, dict):
+            return {"ok": False, "error": MSG[lang]["gen_fail"], "raw": gen[-1500:]}
+        raw_j = str(data.get("judgment", "")).strip()
+        judgment = GRADE_NORMALIZE.get(raw_j) or GRADE_NORMALIZE.get(raw_j.lower())
+        if judgment not in ("상", "중", "하"):          # clamp 실패 → NULL(미판정)
+            return {"ok": False, "error": MSG[lang]["gen_fail"], "raw": gen[-1500:]}
+        reason = str(data.get("reason", "")).strip()[:500]
+        return {"ok": True, "judgment": judgment, "reason": reason}
+    except Exception:
+        return {"ok": False, "error": MSG[lang]["gen_fail"]}
+
+
+# ── 콘텐츠 유해도 2차 필터(A-008) — POST /content/filter (매 작성, 8s 핫패스) ──
+CONTENT_FILTER_PREFILL = {
+    "ko": "먼저 콘텐츠의 유해성 정도를 커뮤니티 기준으로 살펴보고, 유해/경미/정상 중 하나로 분류한 뒤 근거를 정리하겠습니다. ",
+    "en": "First, I will assess the content's harmfulness and classify it. ",
+}
+# LLM은 분류만(의미). 점수는 결정론적 매핑 → 항상 DECIMAL(5,2)·CHECK(0~100) 안, 유해(90)만 ≥75 차단.
+CONTENT_LEVEL_SCORE = {"유해": 90.00, "경미": 45.00, "정상": 5.00}
+CONTENT_LEVEL_NORMALIZE = {
+    "유해": "유해", "경미": "경미", "정상": "정상",
+    "harmful": "유해", "toxic": "유해", "mild": "경미", "clean": "정상", "safe": "정상",
+}
+
+class ContentFilterReq(BaseModel):
+    targetType: str = None
+    content: str = None
+    lang: str = "ko"
+
+@app.post("/content/filter")
+def content_filter(req: ContentFilterReq):
+    lang = norm_lang(req.lang)
+    nr = not_ready(lang)
+    if nr:                                  # 미로딩 → ok:false → 소비자 fail-open(글쓰기 통과)
+        return nr
+    content = (req.content or "").strip()
+    if not content:
+        return {"ok": False, "error": MSG[lang]["gen_fail"]}
+    snippet = content[:2000]
+    prompt = (
+        f"당신은 커뮤니티 콘텐츠 검열 보조 AI입니다. 아래 내용의 유해성을 판단하세요.\n"
+        f"유해 예: 심한 욕설/모욕, 혐오/차별, 음란물, 명백한 스팸/광고.\n"
+        f"명백히 유해하면 '유해', 애매하면 '경미', 문제없으면 '정상'으로 분류하세요.\n\n"
+        f"[내용]\n{snippet}\n\n"
+        f"한국어로 한 문장 사유를 쓰세요. JSON만 출력하세요.\n"
+        f"형식: {{\"level\": \"정상\", \"reason\": \"...\"}}"
+    )
+    try:
+        gen = run_llm(prompt, CONTENT_FILTER_PREFILL[lang], use_adapter=False,
+                      max_new_tokens=256, reason_budget=200)     # 8s 핫패스 → 예산 축소
+        data = parse_json_lenient(gen)
+        if not isinstance(data, dict):
+            return {"ok": False, "error": MSG[lang]["gen_fail"], "raw": gen[-1500:]}
+        raw_l = str(data.get("level", "")).strip()
+        level = CONTENT_LEVEL_NORMALIZE.get(raw_l) or CONTENT_LEVEL_NORMALIZE.get(raw_l.lower())
+        if level not in CONTENT_LEVEL_SCORE:
+            return {"ok": False, "error": MSG[lang]["gen_fail"], "raw": gen[-1500:]}
+        score = CONTENT_LEVEL_SCORE[level]              # 결정론적, 항상 유효
+        reason = str(data.get("reason", "")).strip()[:500]
+        return {"ok": True, "score": score, "reason": reason}
+    except Exception:
+        return {"ok": False, "error": MSG[lang]["gen_fail"]}
