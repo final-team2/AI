@@ -2523,3 +2523,59 @@ def content_filter(req: ContentFilterReq):
         return {"ok": True, "score": score, "reason": reason}
     except Exception:
         return {"ok": False, "error": MSG[lang]["gen_fail"]}
+
+
+# ── 교육 일일 체크리스트(K-006) — POST /education/checklist/daily ──────────────
+CHECKLIST_PREFILL = {
+    "ko": "먼저 학습 주제와 난이도를 살펴보고, 오늘 하루 실천할 구체적인 체크리스트 항목을 어떻게 구성할지 생각하겠습니다. ",
+    "en": "First, I will consider the topic and difficulty, then compose concrete daily checklist items. ",
+}
+
+class ChecklistReq(BaseModel):
+    memberId: int = None
+    goalDate: str = None
+    count: int = 3
+    category: str = None
+    difficulty: str = None
+    lang: str = "ko"
+
+@app.post("/education/checklist/daily")
+def education_checklist_daily(req: ChecklistReq):
+    lang = norm_lang(req.lang)
+    category   = (req.category or "웹 개발").strip()
+    difficulty = (req.difficulty or "중").strip()
+    n = max(1, min(req.count or 3, 10))          # count 클램프(음수·과다 방어)
+
+    # 정적 폴백 (LLM 실패·미로딩 시 항상 이걸로 goals 반환)
+    fallback = [
+        f"{category} 핵심 개념 1개 정리하기",
+        f"{category} 관련 실습 예제 1개 따라 해보기",
+        f"{category} 예상 면접 질문 1개 답변 작성하기",
+        f"{category} 학습 내용 5줄로 요약하기",
+        f"{difficulty} 난이도 기준 부족한 개념 복습하기",
+    ][:n]
+
+    # 미로딩 → not_ready 대신 직접 조건(ok 키 내면 안 됨) → 폴백 즉답
+    if "llm" not in M:
+        return {"goals": fallback}
+
+    prompt = (
+        f"당신은 웹 개발자 취업 준비생의 학습 코치입니다.\n"
+        f"직군/주제: {category}\n난이도: {difficulty}\n"
+        f"오늘 하루 실천할 학습 체크리스트 항목을 정확히 {n}개 생성하세요.\n"
+        f"규칙: 각 항목은 한 줄, 오늘 안에 실천 가능한 구체적 행동, 이유·번호·불릿 없이 "
+        f"항목 텍스트만. JSON만 출력하세요.\n"
+        f'형식: {{"goals": ["...", "..."]}} (정확히 {n}개)'
+    )
+    try:
+        # ⚠️ GEN_LOCK으로 감싸지 말 것 — run_llm 내부가 이미 잡음(이중 acquire 데드락)
+        gen = run_llm(prompt, CHECKLIST_PREFILL[lang], use_adapter=False,
+                      max_new_tokens=512, do_sample=True, reason_budget=300)
+        data = parse_json_lenient(gen)
+        goals = data.get("goals") if isinstance(data, dict) else None
+        goals = [str(g).strip() for g in goals if str(g).strip()] if isinstance(goals, list) else []
+        if not goals:
+            return {"goals": fallback}
+        return {"goals": goals[:n]}
+    except Exception:
+        return {"goals": fallback}
